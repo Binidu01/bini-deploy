@@ -1,5 +1,3 @@
-#!/usr/bin/env node
-
 import { existsSync, readdirSync, mkdirSync, readFileSync, statSync, writeFileSync, unlinkSync, rmSync } from 'fs';
 import { writeFile } from 'fs/promises';
 import { createRequire } from 'module';

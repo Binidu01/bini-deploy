@@ -9,10 +9,8 @@ export default defineConfig({
   clean: true,
   target: 'node20',
   platform: 'node',
-  esbuildOptions(options) {
-    options.banner = {
-      js: '#!/usr/bin/env node\n',
-    };
+  banner: {
+    js: '#!/usr/bin/env node\n',
   },
   outDir: 'dist',
   external: [
@@ -20,9 +18,14 @@ export default defineConfig({
     'cross-spawn',
     'inquirer',
     'ora',
-    'fs',
-    'path',
-    'url',
-    'child_process',
   ],
+  noExternal: [
+    // Any packages you want to bundle instead of keeping external
+  ],
+  esbuildOptions(options) {
+    // Ensure the banner is applied correctly
+    options.banner = {
+      js: '#!/usr/bin/env node\n',
+    };
+  },
 });
