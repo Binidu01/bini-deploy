@@ -20,8 +20,9 @@
 - **Native platform support** — Windows, macOS, Linux, iOS, and Android via Tauri/Capacitor, with tailored next-step instructions for each.
 - **Git push built in** — initializes the repo if needed, commits, and pushes, so `bini-deploy` is genuinely one command from zero to deployed.
 - **Interactive or scriptable** — walk through prompts, or skip them entirely with flags for CI.
-- **Vite plugin included** — opt into automatic deploys on dev server start via environment variables.
 - **Automatic platform cleanup** — removes old configuration files and directories when switching platforms, keeping your repository clean.
+- **Always pushes to main** — automatically handles branch naming, never pushes to master.
+- **Hono support** — detects Hono apps and mounts them correctly.
 
 ## Installation
 
@@ -133,30 +134,6 @@ app.post('/', async (c) => {
 export default app;
 ```
 
-## Using it as a Vite plugin
-
-`bini-deploy` can trigger itself automatically when your dev server starts, driven by environment variables — handy for automated preview environments.
-
-```typescript
-// vite.config.ts
-import { defineConfig } from 'vite';
-import { biniDeploy } from 'bini-deploy';
-
-export default defineConfig({
-  plugins: [biniDeploy()],
-});
-```
-
-```bash
-BINI_AUTO_DEPLOY=true \
-BINI_DEPLOY_PLATFORM=web \
-BINI_DEPLOY_HOSTING=vercel \
-BINI_DEPLOY_REPO=https://github.com/you/your-app \
-npm run dev
-```
-
-The plugin automatically skips itself if it detects a Tauri (`src-tauri/`) or Capacitor (`capacitor.config.json`) project, since those aren't web deploys.
-
 ## How it works
 
 1. **Scan** — `bini-deploy` scans your `src/app/api/` directory for route files
@@ -170,13 +147,14 @@ The plugin automatically skips itself if it detects a Tauri (`src-tauri/`) or Ca
 - **Existing remote** — If your project already has a git remote configured, `bini-deploy` uses it without modification
 - **New projects** — If no remote exists, `bini-deploy` adds the provided URL as `origin`
 - **No remote updates** — Once a remote is set, it is never changed or updated
+- **Always main** — `bini-deploy` always pushes to the `main` branch, automatically renaming `master` to `main` if needed
 
 This ensures you can run `bini-deploy` multiple times without accidentally pushing to the wrong repository.
 
 ## Requirements
 
 - Node.js **>= 18**
-- Vite **8**
+- Vite **>= 6**
 - A GitHub repository to push to (created ahead of time)
 - `git` available on your `PATH`
 

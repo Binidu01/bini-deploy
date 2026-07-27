@@ -1,4 +1,3 @@
-import type { Plugin } from 'vite';
 import { existsSync, readdirSync, mkdirSync, readFileSync, statSync, writeFileSync, unlinkSync, rmSync } from 'fs';
 import { writeFile } from 'fs/promises';
 import { createRequire } from 'module';
@@ -854,18 +853,53 @@ async function pushToGitHub(githubRepo: string): Promise<void> {
     log.info('No changes to commit');
   }
 
-  // Push to remote
+  // Check if we're on main or need to switch
+  let currentBranch = 'main';
+  try {
+    const branch = await execAsyncWithOutput('git', ['branch', '--show-current']);
+    if (branch.trim()) {
+      currentBranch = branch.trim();
+    }
+  } catch {
+    // If we can't get branch, default to main
+  }
+
+  // If we're on master, rename to main or switch
+  if (currentBranch === 'master') {
+    log.info('Switching from master to main...');
+    try {
+      // Check if main exists locally
+      const mainExists = await execAsyncWithOutput('git', ['branch', '--list', 'main']);
+      if (mainExists.trim()) {
+        // Switch to main
+        await execAsync('git', ['checkout', 'main']);
+      } else {
+        // Rename master to main
+        await execAsync('git', ['branch', '-m', 'master', 'main']);
+      }
+      currentBranch = 'main';
+    } catch (error) {
+      log.warn('Could not switch to main, trying to push anyway...');
+    }
+  }
+
+  // Push to remote - ALWAYS use main
   log.info('Pushing to GitHub...');
   try {
-    await execAsync('git', ['push', '-u', 'origin', 'HEAD:main']);
+    // First try to push with explicit main branch
+    await execAsync('git', ['push', '-u', 'origin', 'main']);
     log.success('Push successful');
-  } catch {
+  } catch (pushError) {
+    // If main fails, try to set upstream and push
     try {
-      await execAsync('git', ['push', '-u', 'origin', 'HEAD:master']);
+      await execAsync('git', ['push', '-u', 'origin', 'HEAD:main']);
       log.success('Push successful');
-    } catch (pushError) {
+    } catch (secondError) {
+      // If all fails, show error
       log.error('Failed to push to GitHub');
-      throw pushError;
+      const msg = secondError instanceof Error ? secondError.message : String(secondError);
+      log.error(`Error: ${msg}`);
+      throw secondError;
     }
   }
 }
@@ -1170,44 +1204,6 @@ async function deployCLI(): Promise<void> {
     log.error(`Deployment failed: ${message}`);
     process.exit(1);
   }
-}
-
-// ─── Vite Plugin ────────────────────────────────────────────────────────────
-
-export function biniDeploy(): Plugin {
-  return {
-    name: 'bini-deploy',
-    enforce: 'pre',
-    apply: 'serve',
-
-    buildStart() {
-      const cwd = process.cwd();
-      const hasTauri = existsSync(path.join(cwd, 'src-tauri'));
-      const hasCapacitor = existsSync(path.join(cwd, 'capacitor.config.json'));
-
-      if (hasTauri || hasCapacitor) {
-        log.info('Native platform detected (Tauri/Capacitor) - skipping automatic deploy');
-        return;
-      }
-
-      const shouldAutoDeploy = process.env.BINI_AUTO_DEPLOY === 'true';
-      if (!shouldAutoDeploy) {
-        return;
-      }
-
-      const platform = process.env.BINI_DEPLOY_PLATFORM as DeployAnswers['platform'] || 'web';
-      const hosting = process.env.BINI_DEPLOY_HOSTING as Platform;
-      const repo = process.env.BINI_DEPLOY_REPO;
-
-      if (platform === 'web' && hosting && hosting !== 'node' && repo) {
-        log.info(`Auto-deploying to ${HOSTING_CONFIGS[hosting].label}`);
-        deployCLI().catch((err: unknown) => {
-          const message = err instanceof Error ? err.message : String(err);
-          log.error(`Auto-deploy failed: ${message}`);
-        });
-      }
-    },
-  };
 }
 
 // ─── Main Entry ─────────────────────────────────────────────────────────────
