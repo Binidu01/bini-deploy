@@ -1,3 +1,5 @@
+#!/usr/bin/env node
+
 import { existsSync, readdirSync, mkdirSync, readFileSync, statSync, writeFileSync, unlinkSync, rmSync } from 'fs';
 import { writeFile } from 'fs/promises';
 import { createRequire } from 'module';
@@ -703,11 +705,11 @@ function getGitConfig(key: string): Promise<string | null> {
       windowsHide: true,
     });
     let output = '';
-    child.stdout?.on('data', (chunk) => {
+    child.stdout?.on('data', (chunk: Buffer) => {
       output += chunk.toString();
     });
     child.on('error', () => resolve(null));
-    child.on('exit', (code) => resolve(code === 0 ? output.trim() : null));
+    child.on('exit', (code: number | null) => resolve(code === 0 ? output.trim() : null));
   });
 }
 
@@ -754,7 +756,7 @@ async function execAsync(cmd: string, args: string[]): Promise<void> {
       windowsHide: true,
     });
     child.on('error', reject);
-    child.on('exit', (code) => {
+    child.on('exit', (code: number | null) => {
       if (code === 0) resolve();
       else reject(new Error(`Command failed with code ${code}`));
     });
@@ -770,15 +772,15 @@ async function execAsyncWithOutput(cmd: string, args: string[]): Promise<string>
     let output = '';
     let error = '';
     
-    child.stdout?.on('data', (chunk) => {
+    child.stdout?.on('data', (chunk: Buffer) => {
       output += chunk.toString();
     });
-    child.stderr?.on('data', (chunk) => {
+    child.stderr?.on('data', (chunk: Buffer) => {
       error += chunk.toString();
     });
     
     child.on('error', reject);
-    child.on('exit', (code) => {
+    child.on('exit', (code: number | null) => {
       if (code === 0) resolve(output);
       else reject(new Error(`Command failed with code ${code}: ${error}`));
     });
@@ -883,6 +885,15 @@ async function pushToGitHub(githubRepo: string): Promise<void> {
     }
   }
 
+  // Try to pull first to avoid rejection
+  log.info('Fetching remote changes...');
+  try {
+    await execAsync('git', ['pull', 'origin', 'main', '--no-rebase', '--allow-unrelated-histories']);
+    log.info('Successfully pulled remote changes');
+  } catch (pullError) {
+    log.warn('Could not pull remote changes, will try force push...');
+  }
+
   // Push to remote - ALWAYS use main
   log.info('Pushing to GitHub...');
   try {
@@ -890,10 +901,11 @@ async function pushToGitHub(githubRepo: string): Promise<void> {
     await execAsync('git', ['push', '-u', 'origin', 'main']);
     log.success('Push successful');
   } catch (pushError) {
-    // If main fails, try to set upstream and push
+    // If main fails, try force push as last resort
     try {
-      await execAsync('git', ['push', '-u', 'origin', 'HEAD:main']);
-      log.success('Push successful');
+      log.warn('Force pushing to main...');
+      await execAsync('git', ['push', '-u', 'origin', 'main', '--force']);
+      log.success('Force push successful');
     } catch (secondError) {
       // If all fails, show error
       log.error('Failed to push to GitHub');
