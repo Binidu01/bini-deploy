@@ -1218,8 +1218,11 @@ async function deployCLI(): Promise<void> {
 
 // ─── Main Entry ─────────────────────────────────────────────────────────────
 
-const isMainModule =
-  process.argv[1] !== undefined && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+// Get the current file path
+const __filename = fileURLToPath(import.meta.url);
+
+// Check if this module is being run directly
+const isMainModule = process.argv[1] === __filename;
 
 if (isMainModule) {
   deployCLI().catch((error: unknown) => {
