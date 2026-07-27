@@ -16,4 +16,10 @@ export default defineConfig({
     'inquirer',
     'ora',
   ],
+  esbuildOptions(options) {
+    options.banner = {
+      js: '#!/usr/bin/env node\n',
+    };
+    return options;
+  },
 });
