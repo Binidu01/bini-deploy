@@ -1,6 +1,6 @@
 {
   "name": "bini-deploy",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "description": "Deploy Bini.js projects to any platform",
   "type": "module",
   "main": "dist/index.js",

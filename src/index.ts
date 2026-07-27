@@ -283,7 +283,7 @@ function scanApiRoutes(dir: string, baseRoute = '', basePath: string = '', depth
   return routes;
 }
 
-// ─── Route Import Builder ──────────────────────────────────────────────────
+// ─── Route Import Builder ─────────────────────────────────────────────────
 
 function resolveEntryImportPath(
   filePath: string,
@@ -703,11 +703,11 @@ function getGitConfig(key: string): Promise<string | null> {
       windowsHide: true,
     });
     let output = '';
-    child.stdout?.on('data', (chunk: Buffer) => {
+    child.stdout?.on('data', (chunk) => {
       output += chunk.toString();
     });
     child.on('error', () => resolve(null));
-    child.on('exit', (code: number | null) => resolve(code === 0 ? output.trim() : null));
+    child.on('exit', (code) => resolve(code === 0 ? output.trim() : null));
   });
 }
 
@@ -754,7 +754,7 @@ async function execAsync(cmd: string, args: string[]): Promise<void> {
       windowsHide: true,
     });
     child.on('error', reject);
-    child.on('exit', (code: number | null) => {
+    child.on('exit', (code) => {
       if (code === 0) resolve();
       else reject(new Error(`Command failed with code ${code}`));
     });
@@ -770,15 +770,15 @@ async function execAsyncWithOutput(cmd: string, args: string[]): Promise<string>
     let output = '';
     let error = '';
     
-    child.stdout?.on('data', (chunk: Buffer) => {
+    child.stdout?.on('data', (chunk) => {
       output += chunk.toString();
     });
-    child.stderr?.on('data', (chunk: Buffer) => {
+    child.stderr?.on('data', (chunk) => {
       error += chunk.toString();
     });
     
     child.on('error', reject);
-    child.on('exit', (code: number | null) => {
+    child.on('exit', (code) => {
       if (code === 0) resolve(output);
       else reject(new Error(`Command failed with code ${code}: ${error}`));
     });
@@ -883,34 +883,75 @@ async function pushToGitHub(githubRepo: string): Promise<void> {
     }
   }
 
-  // Try to pull first to avoid rejection
-  log.info('Fetching remote changes...');
-  try {
-    await execAsync('git', ['pull', 'origin', 'main', '--no-rebase', '--allow-unrelated-histories']);
-    log.info('Successfully pulled remote changes');
-  } catch (pullError) {
-    log.warn('Could not pull remote changes, will try force push...');
+  // Push to remote - ALWAYS use main.
+  // If the remote has commits we don't have locally (e.g. GitHub auto-created
+  // a README when the repo was made), a plain push is rejected as a
+  // non-fast-forward. In that case, fetch + merge the remote history in
+  // (allowing unrelated histories, since a brand-new local repo won't share
+  // a common ancestor with the remote's initial commit) and retry the push
+  // before giving up.
+  log.info('Pushing to GitHub...');
+
+  const tryPush = async (): Promise<boolean> => {
+    try {
+      await execAsync('git', ['push', '-u', 'origin', 'main']);
+      return true;
+    } catch {
+      try {
+        await execAsync('git', ['push', '-u', 'origin', 'HEAD:main']);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+  };
+
+  if (await tryPush()) {
+    log.success('Push successful');
+    return;
   }
 
-  // Push to remote - ALWAYS use main
-  log.info('Pushing to GitHub...');
+  log.warn('Push rejected - the remote has commits that are not present locally.');
+  log.info('Attempting to fetch and merge remote changes...');
+
   try {
-    // First try to push with explicit main branch
-    await execAsync('git', ['push', '-u', 'origin', 'main']);
-    log.success('Push successful');
-  } catch (pushError) {
-    // If main fails, try force push as last resort
+    await execAsync('git', ['fetch', 'origin', 'main']);
     try {
-      log.warn('Force pushing to main...');
-      await execAsync('git', ['push', '-u', 'origin', 'main', '--force']);
-      log.success('Force push successful');
-    } catch (secondError) {
-      // If all fails, show error
-      log.error('Failed to push to GitHub');
-      const msg = secondError instanceof Error ? secondError.message : String(secondError);
-      log.error(`Error: ${msg}`);
-      throw secondError;
+      // -X ours: when the same file differs between local and remote, keep
+      // the local version. Files that only exist on the remote (and don't
+      // conflict with anything local) are still merged in as usual.
+      await execAsync('git', [
+        'merge',
+        'origin/main',
+        '--allow-unrelated-histories',
+        '-X',
+        'ours',
+        '-m',
+        'chore: merge remote changes',
+      ]);
+    } catch (mergeError) {
+      log.error('Automatic merge failed, likely due to conflicting files (e.g. README.md).');
+      log.error('Resolve the conflicts manually, then run:');
+      log.error('  git add .');
+      log.error('  git commit');
+      log.error('  git push -u origin main');
+      throw mergeError;
     }
+
+    if (await tryPush()) {
+      log.success('Push successful after merging remote changes');
+      return;
+    }
+
+    throw new Error('Push still failed after merging remote changes');
+  } catch (error) {
+    log.error('Failed to push to GitHub');
+    const msg = error instanceof Error ? error.message : String(error);
+    log.error(`Error: ${msg}`);
+    log.error('You can resolve this manually by running:');
+    log.error('  git pull origin main --allow-unrelated-histories -X ours');
+    log.error('  git push -u origin main');
+    throw error;
   }
 }
 
@@ -1218,11 +1259,8 @@ async function deployCLI(): Promise<void> {
 
 // ─── Main Entry ─────────────────────────────────────────────────────────────
 
-// Get the current file path
-const __filename = fileURLToPath(import.meta.url);
-
-// Check if this module is being run directly
-const isMainModule = process.argv[1] === __filename;
+const isMainModule =
+  process.argv[1] !== undefined && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
 
 if (isMainModule) {
   deployCLI().catch((error: unknown) => {
