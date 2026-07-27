@@ -1,6 +1,6 @@
 {
   "name": "bini-deploy",
-  "version": "1.0.11",
+  "version": "1.0.12",
   "description": "Deploy Bini.js projects to any platform",
   "type": "module",
   "main": "dist/index.js",
@@ -23,12 +23,13 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "deploy": "node dist/index.js",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "postbuild": "node -e \"try{require('fs').chmodSync('dist/index.js', 0o755)}catch(e){}\""
   },
   "dependencies": {
+    "@inquirer/prompts": "^8.5.2",
     "chalk": "^6.0.0",
     "cross-spawn": "^7.0.6",
-    "inquirer": "^14.0.2",
     "ora": "^9.4.1"
   },
   "peerDependencies": {
@@ -36,7 +37,6 @@
   },
   "devDependencies": {
     "@types/cross-spawn": "^6.0.6",
-    "@types/inquirer": "^9.0.10",
     "@types/node": "^26.1.1",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",

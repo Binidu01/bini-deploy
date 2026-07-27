@@ -4,7 +4,8 @@ import { createRequire } from 'module';
 import crossSpawn from 'cross-spawn';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import inquirer from 'inquirer';
+import { select, input, confirm } from '@inquirer/prompts';
+import { isatty } from 'tty';
 import ora from 'ora';
 import chalk from 'chalk';
 
@@ -128,6 +129,10 @@ const log = {
 };
 
 // ─── Utilities ──────────────────────────────────────────────────────────────
+
+function isInteractive(): boolean {
+  return isatty(process.stdin.fd) && isatty(process.stdout.fd);
+}
 
 function norm(p: string): string {
   return p.replace(/\\/g, '/');
@@ -721,28 +726,28 @@ async function ensureGitIdentity(): Promise<void> {
 
   log.warn('Git author identity is not set - needed to create a commit.');
 
-  const answers = await inquirer.prompt<{ gitName?: string; gitEmail?: string }>([
-    {
-      type: 'input',
-      name: 'gitName',
-      message: 'Your name (for git commits):',
-      when: () => !existingName,
-      validate: (input: string) => input.trim().length > 0 || 'Name is required',
-    },
-    {
-      type: 'input',
-      name: 'gitEmail',
-      message: 'Your email (for git commits):',
-      when: () => !existingEmail,
-      validate: (input: string) => /\S+@\S+\.\S+/.test(input) || 'Enter a valid email address',
-    },
-  ]);
+  let gitName = existingName;
+  let gitEmail = existingEmail;
 
-  if (answers.gitName) {
-    await execAsync('git', ['config', 'user.name', answers.gitName]);
+  if (!gitName) {
+    gitName = await input({
+      message: 'Your name (for git commits):',
+      validate: (input: string) => input.trim().length > 0 || 'Name is required',
+    });
   }
-  if (answers.gitEmail) {
-    await execAsync('git', ['config', 'user.email', answers.gitEmail]);
+
+  if (!gitEmail) {
+    gitEmail = await input({
+      message: 'Your email (for git commits):',
+      validate: (input: string) => /\S+@\S+\.\S+/.test(input) || 'Enter a valid email address',
+    });
+  }
+
+  if (gitName) {
+    await execAsync('git', ['config', 'user.name', gitName]);
+  }
+  if (gitEmail) {
+    await execAsync('git', ['config', 'user.email', gitEmail]);
   }
 }
 
@@ -1006,39 +1011,28 @@ ${chalk.bold('Examples:')}
 }
 
 async function getAnswersInteractive(): Promise<DeployAnswers> {
-  const platform = await inquirer.prompt<{ platform: DeployAnswers['platform'] }>([
-    {
-      type: 'select',
-      name: 'platform',
-      message: 'Select your target platform:',
-      choices: [
-        { name: 'Web', value: 'web' },
-        { name: 'Windows', value: 'windows' },
-        { name: 'macOS', value: 'macos' },
-        { name: 'iOS', value: 'ios' },
-        { name: 'Linux', value: 'linux' },
-        { name: 'Android', value: 'android' },
-      ],
-      pageSize: 10,
-    },
-  ]);
+  const platform = await select<DeployAnswers['platform']>({
+    message: 'Select your target platform:',
+    choices: [
+      { name: 'Web', value: 'web' },
+      { name: 'Windows', value: 'windows' },
+      { name: 'macOS', value: 'macos' },
+      { name: 'iOS', value: 'ios' },
+      { name: 'Linux', value: 'linux' },
+      { name: 'Android', value: 'android' },
+    ],
+  });
 
   let webHosting: Platform | undefined;
 
-  if (platform.platform === 'web') {
-    const hostingResult = await inquirer.prompt<{ webHosting: Platform }>([
-      {
-        type: 'select',
-        name: 'webHosting',
-        message: 'Select hosting provider:',
-        choices: Object.entries(HOSTING_CONFIGS).map(([key, config]) => ({
-          name: config.label,
-          value: key as Platform,
-        })),
-        pageSize: 10,
-      },
-    ]);
-    webHosting = hostingResult.webHosting;
+  if (platform === 'web') {
+    webHosting = await select<Platform>({
+      message: 'Select hosting provider:',
+      choices: Object.entries(HOSTING_CONFIGS).map(([key, config]) => ({
+        name: config.label,
+        value: key as Platform,
+      })),
+    });
   }
 
   // Check if git remote already exists
@@ -1061,20 +1055,15 @@ async function getAnswersInteractive(): Promise<DeployAnswers> {
 
   // Only ask for GitHub URL if no remote exists
   if (!githubRepo) {
-    const { repo } = await inquirer.prompt<{ repo: string }>([
-      {
-        type: 'input',
-        name: 'repo',
-        message: 'Enter your GitHub repository URL:',
-        validate: (input: string) =>
-          GITHUB_URL_REGEX.test(input) || 'Please enter a valid GitHub repository URL',
-      },
-    ]);
-    githubRepo = repo;
+    githubRepo = await input({
+      message: 'Enter your GitHub repository URL:',
+      validate: (input: string) =>
+        GITHUB_URL_REGEX.test(input) || 'Please enter a valid GitHub repository URL',
+    });
   }
 
   return {
-    platform: platform.platform,
+    platform,
     webHosting,
     githubRepo,
     projectName: githubRepo.split('/').pop() || 'my-app',
@@ -1094,7 +1083,7 @@ async function getAnswersFromFlags(flags: Partial<DeployAnswers>): Promise<Deplo
   const webHosting = flags.platform === 'web' ? flags.webHosting ?? 'node' : flags.webHosting;
 
   return {
-    platform: flags.platform,
+    platform: flags.platform as DeployAnswers['platform'],
     webHosting,
     githubRepo: flags.githubRepo,
     projectName: flags.githubRepo.split('/').pop() || 'my-app',
@@ -1218,9 +1207,17 @@ async function deployCLI(): Promise<void> {
       process.exit(0);
     }
 
-    const answers = flags.skipPrompts
-      ? await getAnswersFromFlags(flags)
-      : await getAnswersInteractive();
+    let answers: DeployAnswers;
+    
+    if (flags.skipPrompts) {
+      answers = await getAnswersFromFlags(flags);
+    } else if (!isInteractive()) {
+      log.error('Interactive mode requires a TTY. Use --yes flag with required options.');
+      log.info('Example: bini-deploy --platform web --hosting vercel --repo https://github.com/user/repo --yes');
+      process.exit(1);
+    } else {
+      answers = await getAnswersInteractive();
+    }
 
     validateAnswers(answers);
 
@@ -1233,17 +1230,13 @@ async function deployCLI(): Promise<void> {
     }
     console.log(`  ${chalk.gray('Repository:')} ${chalk.cyan(answers.githubRepo)}`);
 
-    if (!answers.skipPrompts) {
-      const { confirm } = await inquirer.prompt<{ confirm: boolean }>([
-        {
-          type: 'confirm',
-          name: 'confirm',
-          message: 'Generate deployment files and push to GitHub?',
-          default: true,
-        },
-      ]);
+    if (!answers.skipPrompts && isInteractive()) {
+      const confirmed = await confirm({
+        message: 'Generate deployment files and push to GitHub?',
+        default: true,
+      });
 
-      if (!confirm) {
+      if (!confirmed) {
         log.info('Deployment cancelled.');
         return;
       }

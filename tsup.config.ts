@@ -11,9 +11,9 @@ export default defineConfig({
   platform: 'node',
   outDir: 'dist',
   external: [
+    '@inquirer/prompts',  
     'chalk',
     'cross-spawn',
-    'inquirer',
     'ora',
   ],
   esbuildOptions(options) {
