@@ -1,0 +1,51 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+ 
+# Build outputs
+dist/
+build/
+out/
+.next/
+.nuxt/
+.vuepress/dist/
+
+# Package manager lock files (if you want to exclude them)
+pnpm-lock.yaml
+package-lock.json
+yarn.lock
+
+# Workspace files (if you want to exclude)
+pnpm-workspace.yaml
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Testing
+coverage/
+.nyc_output/
+
+# Temp files
+tmp/
+temp/
+*.tmp
+
+# OS files
+Thumbs.db
+.DS_Store
