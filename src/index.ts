@@ -555,6 +555,73 @@ function checkAdapter(platform: NonNodePlatform): void {
   }
 }
 
+// FIX: cleanup previously only ran inside generateProductionEntry/
+// generateHostingConfig, and neither of those functions is ever called when
+// the selected hosting is 'node' — so switching back to Node left old
+// entry files (api/index.ts, worker.ts, etc.), config files (vercel.json,
+// netlify.toml, wrangler.toml), and platform directories (netlify/, server/)
+// sitting in the repo untouched. This function is the single source of
+// cleanup truth and is called for every hosting selection, including 'node'.
+function cleanupPlatformArtifacts(hosting: Platform, ts: boolean): void {
+  const cwd = process.cwd();
+  const allPlatforms: NonNodePlatform[] = ['netlify', 'vercel', 'cloudflare', 'deno'];
+
+  // Remove generated entry files for every platform except the selected one.
+  for (const platform of allPlatforms) {
+    if (platform === hosting) continue;
+    const adapter = ADAPTERS[platform];
+    const oldFile = adapter.outFile(cwd, ts);
+    if (existsSync(oldFile)) {
+      try {
+        unlinkSync(oldFile);
+        log.info(`Removed old entry: ${path.relative(cwd, oldFile)}`);
+      } catch (error) {
+        // Ignore if file can't be removed
+      }
+    }
+  }
+
+  // Remove hosting config files for every platform except the selected one.
+  for (const platform of allPlatforms) {
+    if (platform === hosting) continue;
+    const configFile = HOSTING_CONFIGS[platform].configFile;
+    if (!configFile) continue;
+    const filePath = path.join(cwd, configFile);
+    if (existsSync(filePath)) {
+      try {
+        unlinkSync(filePath);
+        log.info(`Removed old config: ${configFile}`);
+      } catch (error) {
+        // Ignore if file can't be removed
+      }
+    }
+  }
+
+  // Remove platform-specific directories for every platform except the
+  // selected one.
+  const platformDirs: Record<NonNodePlatform, string> = {
+    netlify: 'netlify',
+    vercel: 'api',
+    cloudflare: '',
+    deno: 'server',
+  };
+
+  for (const platform of allPlatforms) {
+    if (platform === hosting) continue;
+    const dir = platformDirs[platform];
+    if (!dir) continue;
+    const dirPath = path.join(cwd, dir);
+    if (existsSync(dirPath) && statSync(dirPath).isDirectory()) {
+      try {
+        rmSync(dirPath, { recursive: true, force: true });
+        log.info(`Removed old directory: ${dir}`);
+      } catch (error) {
+        // Ignore if directory can't be removed
+      }
+    }
+  }
+}
+
 export async function generateProductionEntry(
   platform: NonNodePlatform,
   apiDir?: string,
@@ -569,21 +636,7 @@ export async function generateProductionEntry(
   // being re-invoked on every loop iteration and again later.
   const ts = isTypeScriptProject();
 
-  // Clean up old platform entry files before generating new one
-  const oldPlatforms: NonNodePlatform[] = ['netlify', 'vercel', 'cloudflare', 'deno'];
-  for (const oldPlatform of oldPlatforms) {
-    if (oldPlatform === platform) continue;
-    const adapter = ADAPTERS[oldPlatform];
-    const oldFile = adapter.outFile(cwd, ts);
-    if (existsSync(oldFile)) {
-      try {
-        unlinkSync(oldFile);
-        log.info(`Removed old entry: ${path.relative(cwd, oldFile)}`);
-      } catch (error) {
-        // Ignore if file can't be removed
-      }
-    }
-  }
+  cleanupPlatformArtifacts(platform, ts);
 
   if (!existsSync(srcApiDir)) {
     log.warn('No API directory found, skipping production entry generation');
@@ -632,43 +685,7 @@ async function generateHostingConfig(
 ): Promise<string | null> {
   const cwd = process.cwd();
 
-  // Clean up old hosting config files from other platforms
-  const allPlatforms: NonNodePlatform[] = ['netlify', 'vercel', 'cloudflare', 'deno'];
-  for (const platform of allPlatforms) {
-    if (platform === hosting) continue;
-    const configFile = HOSTING_CONFIGS[platform].configFile;
-    if (!configFile) continue;
-    const filePath = path.join(cwd, configFile);
-    if (existsSync(filePath)) {
-      try {
-        unlinkSync(filePath);
-        log.info(`Removed old config: ${configFile}`);
-      } catch (error) {
-        // Ignore if file can't be removed
-      }
-    }
-  }
-
-  // Clean up platform-specific directories
-  const platformDirs = {
-    netlify: 'netlify',
-    vercel: 'api',
-    cloudflare: '',
-    deno: 'server',
-  };
-
-  for (const [platform, dir] of Object.entries(platformDirs)) {
-    if (platform === hosting || !dir) continue;
-    const dirPath = path.join(cwd, dir);
-    if (existsSync(dirPath) && statSync(dirPath).isDirectory()) {
-      try {
-        rmSync(dirPath, { recursive: true, force: true });
-        log.info(`Removed old directory: ${dir}`);
-      } catch (error) {
-        // Ignore if directory can't be removed
-      }
-    }
-  }
+  cleanupPlatformArtifacts(hosting, isTypeScriptProject());
 
   const configFile = HOSTING_CONFIGS[hosting].configFile;
   if (!configFile) return null;
@@ -1170,10 +1187,23 @@ async function executeDeployment(answers: DeployAnswers): Promise<void> {
       if (configPath) {
         log.info(`Generated ${path.relative(process.cwd(), configPath)}`);
       }
+    } else if (platform === 'web') {
+      // webHosting is 'node' (or unset, which defaults to 'node' — see
+      // getAnswersFromFlags/getAnswersInteractive). Neither generator above
+      // runs in this branch, so cleanup has to be triggered explicitly here
+      // or switching back to Node would silently leave old entry files,
+      // config files, and directories from a previously selected platform.
+      spinner.text = 'Cleaning up old platform artifacts...';
+      cleanupPlatformArtifacts('node', isTypeScriptProject());
     }
 
     if (platform !== 'web') {
+      // Native platforms (windows/macos/ios/linux/android) never need web
+      // hosting config either — if the project previously targeted, say,
+      // Vercel or Cloudflare, those leftover entry files/config files/
+      // directories would otherwise sit in the repo indefinitely.
       spinner.text = `Preparing ${platform} for deployment...`;
+      cleanupPlatformArtifacts('node', isTypeScriptProject());
       log.info(`No configuration needed for ${platform} - pushing existing files to GitHub`);
     }
 

@@ -21,7 +21,7 @@
 - **Native platform support** — Windows, macOS, Linux, iOS, and Android via Tauri/Capacitor, with tailored next-step instructions for each.
 - **Git push built in** — initializes the repo if needed, commits, and pushes, so `bini-deploy` is genuinely one command from zero to deployed.
 - **Interactive or scriptable** — walk through prompts, or skip them entirely with flags for CI.
-- **Automatic platform cleanup** — removes old configuration files and directories when switching platforms, keeping your repository clean.
+- **Automatic platform cleanup** — removes old configuration files and directories left over from a previously selected platform, every time you deploy — including when you switch back to Node or to a native platform (Windows/macOS/iOS/Linux/Android), neither of which need any web hosting config.
 - **Always pushes to main** — automatically handles branch naming, never pushes to master.
 - **Hono support** — detects Hono apps and mounts them correctly.
 - **Dependency checks** — for adapters that import `hono` as an npm package (Vercel, Cloudflare), verifies it's installed before generating a hosting entry and tells you the exact install command if it's missing. Netlify and Deno Deploy import Hono directly from a URL, so no local install is required for those.
@@ -142,7 +142,7 @@ export default app;
 
 1. **Scan** — `bini-deploy` scans your `src/app/api/` directory for route files
 2. **Generate** — Creates the platform-specific entry file and configuration
-3. **Clean** — Removes old configuration files from other platforms
+3. **Clean** — Removes leftover entry files, config files, and directories from any previously selected platform — this runs no matter what you pick next, including Node or a native platform
 4. **Push** — Commits and pushes everything to your GitHub repository
 5. **Deploy** — Your hosting platform automatically deploys from GitHub
 
@@ -160,12 +160,6 @@ This ensures you can run `bini-deploy` multiple times without accidentally pushi
 
 **Build fails with `Cannot read properties of undefined (reading 'readFile')`**
 Your `typescript` dependency resolved to TypeScript 7.x, which shipped as a full Go-native rewrite without a public compiler API (that lands in 7.1). Build tools that call into the classic API — including some hosting-provider build pipelines — break on it. Pin `typescript` to a `^6.x` release in `package.json` rather than using `"latest"`.
-
-**Deployed function crashes with `ERR_MODULE_NOT_FOUND`, even though the build succeeded**
-This means a relative import at runtime is missing its file extension. If the error points at a file under `src/app/api/`, make sure you're on a recent `bini-deploy` version — older versions generated extension-less imports in the production entry file, which Node's ESM loader (used whenever `package.json` has `"type": "module"`) rejects. If the error points at a file *inside* your own route handler (e.g. a local `./utils` import), add the extension yourself (`./utils.js`) — see the ESM note under [API routes](#api-routes).
-
-**A dependency jumped a major version unexpectedly and broke something**
-Check for `"latest"` in your `package.json`. It resolves to whatever is newest at install time, including breaking major versions, with no warning. Pin real ranges (e.g. `"^19.0.0"`) for anything you don't want to silently move underneath you.
 
 ## Requirements
 
