@@ -17,12 +17,14 @@
 
 - **Web hosting, generated for you** — Netlify, Vercel, Cloudflare Workers, or Deno Deploy. Picks the right adapter, writes the config file, and wires up your API routes automatically.
 - **File-based API routing** — drop files in `src/app/api/`, `bini-deploy` scans them and mounts each one as a route (dynamic segments and catch-alls included).
+- **Automatic CORS** — API routes get permissive CORS headers out of the box on every non-Node hosting adapter (Netlify, Vercel, Cloudflare, Deno), so your frontend can call them without extra setup.
 - **Native platform support** — Windows, macOS, Linux, iOS, and Android via Tauri/Capacitor, with tailored next-step instructions for each.
 - **Git push built in** — initializes the repo if needed, commits, and pushes, so `bini-deploy` is genuinely one command from zero to deployed.
 - **Interactive or scriptable** — walk through prompts, or skip them entirely with flags for CI.
 - **Automatic platform cleanup** — removes old configuration files and directories when switching platforms, keeping your repository clean.
 - **Always pushes to main** — automatically handles branch naming, never pushes to master.
 - **Hono support** — detects Hono apps and mounts them correctly.
+- **Dependency checks** — for adapters that import `hono` as an npm package (Vercel, Cloudflare), verifies it's installed before generating a hosting entry and tells you the exact install command if it's missing. Netlify and Deno Deploy import Hono directly from a URL, so no local install is required for those.
 
 ## Installation
 
@@ -85,7 +87,7 @@ bini-deploy
 |----------|---------|------------------|
 | **Node.js** (default) | Node (`bini-server`) | None — `bini-server` handles build/serve out of the box, `bini-deploy` just pushes to GitHub |
 | **Netlify** | Edge Functions (Deno) | `netlify.toml` + `netlify/edge-functions/api.ts` |
-| **Vercel** | Edge Runtime | `vercel.json` + `api/index.ts` |
+| **Vercel** | Node.js Runtime | `vercel.json` + `api/index.ts` |
 | **Cloudflare Workers** | Workers | `wrangler.toml` + `worker.ts` |
 | **Deno Deploy** | Deno | `server/index.ts` |
 
@@ -148,6 +150,7 @@ export default app;
 - **New projects** — If no remote exists, `bini-deploy` adds the provided URL as `origin`
 - **No remote updates** — Once a remote is set, it is never changed or updated
 - **Always main** — `bini-deploy` always pushes to the `main` branch, automatically renaming `master` to `main` if needed
+- **Remote-ahead recovery** — If the push is rejected because the remote has commits you don't have locally (e.g. GitHub auto-created a README when the repo was made), `bini-deploy` fetches and merges the remote history in automatically using `--allow-unrelated-histories -X ours`. This keeps your local version of any file that exists on both sides and only pulls in files that are new on the remote — a warning is printed before the merge runs so this trade-off is never silent. If the merge hits a real conflict it can't resolve this way, it stops and prints the manual recovery steps.
 
 This ensures you can run `bini-deploy` multiple times without accidentally pushing to the wrong repository.
 

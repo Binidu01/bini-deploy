@@ -51,7 +51,8 @@ interface DeployAnswers {
 
 const ADAPTERS: Record<NonNodePlatform, AdapterConfig> = {
   netlify: {
-    pkg: 'hono',
+    // No `pkg` here: usesDenoRuntime is true, so buildEntryContent imports
+    // Hono from a URL (deno.land), never from the local npm package.
     importLine: `import { Hono } from 'https://deno.land/x/hono@v4.3.11/mod.ts';\nimport { handle } from 'https://deno.land/x/hono@v4.3.11/adapter/netlify/index.ts';`,
     exportLine: `export default handle(app);`,
     outFile: (cwd, ts) => path.join(cwd, 'netlify', 'edge-functions', ts ? 'api.ts' : 'api.js'),
@@ -59,6 +60,9 @@ const ADAPTERS: Record<NonNodePlatform, AdapterConfig> = {
     usesDenoRuntime: true,
   },
   cloudflare: {
+    // usesDenoRuntime is false, so buildEntryContent writes
+    // `import { Hono } from 'hono';` — the npm package IS required here.
+    pkg: 'hono',
     exportLine: `export default app;`,
     outFile: (cwd, ts) => path.join(cwd, ts ? 'worker.ts' : 'worker.js'),
     stripsApiPrefix: false,
@@ -66,7 +70,8 @@ const ADAPTERS: Record<NonNodePlatform, AdapterConfig> = {
     spaFallback: true,
   },
   deno: {
-    pkg: 'hono',
+    // No `pkg` here: usesDenoRuntime is true, so buildEntryContent imports
+    // Hono from a URL (deno.land), never from the local npm package.
     importLine: `import { Hono } from 'https://deno.land/x/hono@v4.3.11/mod.ts';`,
     exportLine: `Deno.serve({ port: Number(Deno.env.get('PORT') ?? 3000) }, app.fetch);`,
     outFile: (cwd, ts) => path.join(cwd, 'server', ts ? 'index.ts' : 'index.js'),
@@ -74,7 +79,10 @@ const ADAPTERS: Record<NonNodePlatform, AdapterConfig> = {
     usesDenoRuntime: true,
   },
   vercel: {
-    exportLine: `export const config = { runtime: 'edge' };\nexport default app.fetch;`,
+    // usesDenoRuntime is false, so buildEntryContent writes
+    // `import { Hono } from 'hono';` — the npm package IS required here.
+    pkg: 'hono',
+    exportLine: `export default app.fetch;`,
     outFile: (cwd, ts) => path.join(cwd, 'api', ts ? 'index.ts' : 'index.js'),
     stripsApiPrefix: false,
     usesDenoRuntime: false,
@@ -104,7 +112,7 @@ const WEB_NEXT_STEPS: Record<Platform, string[]> = {
   vercel: [
     `Connect your repo to ${chalk.cyan('Vercel')}`,
     `Build command: ${chalk.yellow('npm run build')}`,
-    `API routes run on ${chalk.cyan('Edge Runtime')}`,
+    `API routes run on ${chalk.cyan('Node.js Runtime')}`,
   ],
   cloudflare: [
     `Install Wrangler: ${chalk.yellow('npm install -g wrangler')}`,
@@ -144,7 +152,7 @@ function toPosixPath(filePath: string): string {
 
 function isTypeScriptProject(): boolean {
   const cwd = process.cwd();
-  
+
   const mainEntries = ['src/main.tsx', 'src/main.ts', 'src/main.jsx', 'src/main.js'];
   for (const entry of mainEntries) {
     if (existsSync(path.join(cwd, entry))) {
@@ -197,12 +205,12 @@ function normalizeRoutePath(routePath: string, basePath: string = ''): string {
   if (normalized === '') return basePath || '/';
   if (!normalized.startsWith('/')) normalized = '/' + normalized;
   if (normalized.endsWith('/') && normalized !== '/') normalized = normalized.slice(0, -1);
-  
+
   if (basePath && basePath !== '/') {
     const cleanBasePath = basePath.replace(/\/$/, '');
     normalized = cleanBasePath + normalized;
   }
-  
+
   return normalized;
 }
 
@@ -513,11 +521,13 @@ function buildEntryContent(
 
 // ─── Production Entry Generator ────────────────────────────────────────────
 
+// FIX: previously this function returned early for BOTH `deno`/`netlify`
+// (before ever checking `adapter.pkg`) AND for platforms with no `pkg`
+// declared (`vercel`/`cloudflare`) — meaning `require.resolve` was never
+// reached for ANY platform and a missing `hono` install was never caught.
+// Now it simply checks whether the adapter declares a required package and,
+// if so, verifies it's resolvable.
 function checkAdapter(platform: NonNodePlatform): void {
-  if (platform === 'deno' || platform === 'netlify') {
-    return;
-  }
-
   const adapter = ADAPTERS[platform];
   if (!adapter.pkg) return;
 
@@ -540,12 +550,16 @@ export async function generateProductionEntry(
   const cwd = process.cwd();
   const srcApiDir = apiDir || path.join(cwd, 'src/app/api');
 
+  // FIX: `isTypeScriptProject()` walks the filesystem and its result can't
+  // change within this function call, so it's computed once here instead of
+  // being re-invoked on every loop iteration and again later.
+  const ts = isTypeScriptProject();
+
   // Clean up old platform entry files before generating new one
   const oldPlatforms: NonNodePlatform[] = ['netlify', 'vercel', 'cloudflare', 'deno'];
   for (const oldPlatform of oldPlatforms) {
     if (oldPlatform === platform) continue;
     const adapter = ADAPTERS[oldPlatform];
-    const ts = isTypeScriptProject();
     const oldFile = adapter.outFile(cwd, ts);
     if (existsSync(oldFile)) {
       try {
@@ -569,8 +583,6 @@ export async function generateProductionEntry(
   }
 
   log.info(`Found ${routes.length} API route(s)`);
-
-  const ts = isTypeScriptProject();
 
   try {
     checkAdapter(platform);
@@ -605,7 +617,7 @@ async function generateHostingConfig(
   projectName: string,
 ): Promise<string | null> {
   const cwd = process.cwd();
-  
+
   // Clean up old hosting config files from other platforms
   const allPlatforms: NonNodePlatform[] = ['netlify', 'vercel', 'cloudflare', 'deno'];
   for (const platform of allPlatforms) {
@@ -672,9 +684,9 @@ async function generateHostingConfig(
     case 'vercel': {
       const config = {
         rewrites: [
-          { source: '/api/(.*)', destination: '/api/index.ts' },
-          { source: '/(.*)', destination: '/index.html' },
-        ],
+          { source: '/api/(.*)', destination: '/api/index' },
+          { source: '/(.*)', destination: '/index.html' }
+        ]
       };
       await writeFile(outFile, JSON.stringify(config, null, 2));
       return outFile;
@@ -774,14 +786,14 @@ async function execAsyncWithOutput(cmd: string, args: string[]): Promise<string>
     });
     let output = '';
     let error = '';
-    
+
     child.stdout?.on('data', (chunk) => {
       output += chunk.toString();
     });
     child.stderr?.on('data', (chunk) => {
       error += chunk.toString();
     });
-    
+
     child.on('error', reject);
     child.on('exit', (code) => {
       if (code === 0) resolve(output);
@@ -922,9 +934,19 @@ async function pushToGitHub(githubRepo: string): Promise<void> {
   try {
     await execAsync('git', ['fetch', 'origin', 'main']);
     try {
-      // -X ours: when the same file differs between local and remote, keep
-      // the local version. Files that only exist on the remote (and don't
-      // conflict with anything local) are still merged in as usual.
+      // NOTE: -X ours is intentional and must stay. When the same file
+      // differs between local and remote, the local version is kept and the
+      // remote version is discarded for that file. Files that only exist on
+      // the remote (and don't conflict with anything local) are still
+      // merged in as usual. We surface a warning right before running it so
+      // this trade-off is visible in the console output, not just in code
+      // comments.
+      log.warn(
+        'Merging remote history with -X ours: for any file that exists both ' +
+        'locally and on the remote, your local version will be kept and the ' +
+        'remote version discarded. Files that only exist on the remote are ' +
+        'still merged in normally.'
+      );
       await execAsync('git', [
         'merge',
         'origin/main',
@@ -1038,7 +1060,7 @@ async function getAnswersInteractive(): Promise<DeployAnswers> {
   // Check if git remote already exists
   let githubRepo = '';
   const isGitRepo = existsSync(path.join(process.cwd(), '.git'));
-  
+
   if (isGitRepo) {
     try {
       // Try to get existing remote URL
@@ -1122,7 +1144,7 @@ async function executeDeployment(answers: DeployAnswers): Promise<void> {
 
     if (platform === 'web' && webHosting && webHosting !== 'node') {
       spinner.text = `Generating production API entry for ${webHosting}...`;
-      
+
       try {
         await generateProductionEntry(webHosting);
       } catch (error) {
@@ -1208,7 +1230,7 @@ async function deployCLI(): Promise<void> {
     }
 
     let answers: DeployAnswers;
-    
+
     if (flags.skipPrompts) {
       answers = await getAnswersFromFlags(flags);
     } else if (!isInteractive()) {
