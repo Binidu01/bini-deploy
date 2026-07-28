@@ -82,7 +82,13 @@ const ADAPTERS: Record<NonNodePlatform, AdapterConfig> = {
     // usesDenoRuntime is false, so buildEntryContent writes
     // `import { Hono } from 'hono';` — the npm package IS required here.
     pkg: 'hono',
-    exportLine: `export default app.fetch;`,
+    // Vercel's zero-config Hono support expects the Hono APP INSTANCE as the
+    // default export, not `app.fetch`. Exporting `app.fetch` isn't
+    // recognized by Vercel's detection, so it falls back to treating the
+    // file as a classic Node `(req, res) => void` handler — which then
+    // warns "default export returned a Response" because app.fetch()
+    // resolves to a real Response object with nowhere to go.
+    exportLine: `export default app;`,
     outFile: (cwd, ts) => path.join(cwd, 'api', ts ? 'index.ts' : 'index.js'),
     stripsApiPrefix: false,
     usesDenoRuntime: false,
