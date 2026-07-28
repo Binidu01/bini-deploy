@@ -308,8 +308,16 @@ function resolveEntryImportPath(
     const withTs = rel.replace(/\.tsx$/, '.ts');
     return withTs.startsWith('.') ? withTs : `./${withTs}`;
   }
+  // FIX: Node's native ESM loader (active here because the user's
+  // package.json declares "type": "module") requires an explicit file
+  // extension on every relative import — unlike CommonJS `require()`, it
+  // never guesses. The route .ts source compiles down to a same-named .js
+  // file, so the generated import must point at `<name>.js`, not the bare
+  // specifier. Without this, Vercel/Cloudflare deployments crash at
+  // invocation with ERR_MODULE_NOT_FOUND even though the build succeeds.
   const stripped = rel.replace(/\.(ts|tsx|js|jsx)$/, '');
-  return stripped.startsWith('.') ? stripped : `./${stripped}`;
+  const withJsExt = `${stripped}.js`;
+  return withJsExt.startsWith('.') ? withJsExt : `./${withJsExt}`;
 }
 
 function buildRouteImports(

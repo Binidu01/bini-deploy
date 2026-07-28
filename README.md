@@ -117,6 +117,8 @@ export default async function handler(req: Request) {
 }
 ```
 
+> **Note on ESM projects:** if your `package.json` has `"type": "module"` (Bini.js projects do by default), Node's native ESM loader requires every relative import to include its file extension explicitly — it doesn't fall back to guessing like CommonJS `require()` does. `bini-deploy` already generates its own imports with the correct `.js` extension for Vercel and Cloudflare, but if your route files import their own local helpers (e.g. `./utils`), make sure those imports include the extension too (`./utils.js`), or the deployed function will crash at invocation with `ERR_MODULE_NOT_FOUND` even though the build succeeds.
+
 ### Hono support
 
 If your route file imports from `hono`, `bini-deploy` detects it and mounts it as a full Hono app:
@@ -153,6 +155,17 @@ export default app;
 - **Remote-ahead recovery** — If the push is rejected because the remote has commits you don't have locally (e.g. GitHub auto-created a README when the repo was made), `bini-deploy` fetches and merges the remote history in automatically using `--allow-unrelated-histories -X ours`. This keeps your local version of any file that exists on both sides and only pulls in files that are new on the remote — a warning is printed before the merge runs so this trade-off is never silent. If the merge hits a real conflict it can't resolve this way, it stops and prints the manual recovery steps.
 
 This ensures you can run `bini-deploy` multiple times without accidentally pushing to the wrong repository.
+
+## Troubleshooting
+
+**Build fails with `Cannot read properties of undefined (reading 'readFile')`**
+Your `typescript` dependency resolved to TypeScript 7.x, which shipped as a full Go-native rewrite without a public compiler API (that lands in 7.1). Build tools that call into the classic API — including some hosting-provider build pipelines — break on it. Pin `typescript` to a `^6.x` release in `package.json` rather than using `"latest"`.
+
+**Deployed function crashes with `ERR_MODULE_NOT_FOUND`, even though the build succeeded**
+This means a relative import at runtime is missing its file extension. If the error points at a file under `src/app/api/`, make sure you're on a recent `bini-deploy` version — older versions generated extension-less imports in the production entry file, which Node's ESM loader (used whenever `package.json` has `"type": "module"`) rejects. If the error points at a file *inside* your own route handler (e.g. a local `./utils` import), add the extension yourself (`./utils.js`) — see the ESM note under [API routes](#api-routes).
+
+**A dependency jumped a major version unexpectedly and broke something**
+Check for `"latest"` in your `package.json`. It resolves to whatever is newest at install time, including breaking major versions, with no warning. Pin real ranges (e.g. `"^19.0.0"`) for anything you don't want to silently move underneath you.
 
 ## Requirements
 
