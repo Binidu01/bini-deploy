@@ -1,10 +1,10 @@
-import { existsSync, readdirSync, mkdirSync, readFileSync, statSync, writeFileSync, unlinkSync, rmSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, readFileSync, statSync, writeFileSync, unlinkSync, rmSync, realpathSync } from 'fs';
 import { writeFile } from 'fs/promises';
 import { createRequire } from 'module';
 import crossSpawn from 'cross-spawn';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { select, input, confirm } from '@inquirer/prompts';
+import { select, input, confirm, password } from '@inquirer/prompts';
 import { isatty } from 'tty';
 import ora from 'ora';
 import chalk from 'chalk';
@@ -20,6 +20,10 @@ const MAX_ROUTE_SEGMENT_LENGTH = 100;
 const MAX_API_SCAN_DEPTH = 100;
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 const API_EXTS = ['.ts', '.js'] as const;
+
+// GitHub's default branch is always "main" - we normalize to it rather
+// than trying to detect/guess a remote's default branch name.
+const DEFAULT_BRANCH = 'main';
 
 type Platform = 'node' | 'netlify' | 'vercel' | 'cloudflare' | 'deno';
 type NonNodePlatform = Exclude<Platform, 'node'>;
@@ -51,8 +55,6 @@ interface DeployAnswers {
 
 const ADAPTERS: Record<NonNodePlatform, AdapterConfig> = {
   netlify: {
-    // No `pkg` here: usesDenoRuntime is true, so buildEntryContent imports
-    // Hono from a URL (deno.land), never from the local npm package.
     importLine: `import { Hono } from 'https://deno.land/x/hono@v4.3.11/mod.ts';\nimport { handle } from 'https://deno.land/x/hono@v4.3.11/adapter/netlify/index.ts';`,
     exportLine: `export default handle(app);`,
     outFile: (cwd, ts) => path.join(cwd, 'netlify', 'edge-functions', ts ? 'api.ts' : 'api.js'),
@@ -60,8 +62,6 @@ const ADAPTERS: Record<NonNodePlatform, AdapterConfig> = {
     usesDenoRuntime: true,
   },
   cloudflare: {
-    // usesDenoRuntime is false, so buildEntryContent writes
-    // `import { Hono } from 'hono';` — the npm package IS required here.
     pkg: 'hono',
     exportLine: `export default app;`,
     outFile: (cwd, ts) => path.join(cwd, ts ? 'worker.ts' : 'worker.js'),
@@ -70,8 +70,6 @@ const ADAPTERS: Record<NonNodePlatform, AdapterConfig> = {
     spaFallback: true,
   },
   deno: {
-    // No `pkg` here: usesDenoRuntime is true, so buildEntryContent imports
-    // Hono from a URL (deno.land), never from the local npm package.
     importLine: `import { Hono } from 'https://deno.land/x/hono@v4.3.11/mod.ts';`,
     exportLine: `Deno.serve({ port: Number(Deno.env.get('PORT') ?? 3000) }, app.fetch);`,
     outFile: (cwd, ts) => path.join(cwd, 'server', ts ? 'index.ts' : 'index.js'),
@@ -79,15 +77,7 @@ const ADAPTERS: Record<NonNodePlatform, AdapterConfig> = {
     usesDenoRuntime: true,
   },
   vercel: {
-    // usesDenoRuntime is false, so buildEntryContent writes
-    // `import { Hono } from 'hono';` — the npm package IS required here.
     pkg: 'hono',
-    // Vercel's zero-config Hono support expects the Hono APP INSTANCE as the
-    // default export, not `app.fetch`. Exporting `app.fetch` isn't
-    // recognized by Vercel's detection, so it falls back to treating the
-    // file as a classic Node `(req, res) => void` handler — which then
-    // warns "default export returned a Response" because app.fetch()
-    // resolves to a real Response object with nowhere to go.
     exportLine: `export default app;`,
     outFile: (cwd, ts) => path.join(cwd, 'api', ts ? 'index.ts' : 'index.js'),
     stripsApiPrefix: false,
@@ -145,7 +135,15 @@ const log = {
 // ─── Utilities ──────────────────────────────────────────────────────────────
 
 function isInteractive(): boolean {
-  return isatty(process.stdin.fd) && isatty(process.stdout.fd);
+  try {
+    return isatty(process.stdin.fd) && isatty(process.stdout.fd);
+  } catch {
+    return false;
+  }
+}
+
+function isExitPromptError(err: unknown): boolean {
+  return err instanceof Error && err.name === 'ExitPromptError';
 }
 
 function norm(p: string): string {
@@ -314,13 +312,6 @@ function resolveEntryImportPath(
     const withTs = rel.replace(/\.tsx$/, '.ts');
     return withTs.startsWith('.') ? withTs : `./${withTs}`;
   }
-  // FIX: Node's native ESM loader (active here because the user's
-  // package.json declares "type": "module") requires an explicit file
-  // extension on every relative import — unlike CommonJS `require()`, it
-  // never guesses. The route .ts source compiles down to a same-named .js
-  // file, so the generated import must point at `<name>.js`, not the bare
-  // specifier. Without this, Vercel/Cloudflare deployments crash at
-  // invocation with ERR_MODULE_NOT_FOUND even though the build succeeds.
   const stripped = rel.replace(/\.(ts|tsx|js|jsx)$/, '');
   const withJsExt = `${stripped}.js`;
   return withJsExt.startsWith('.') ? withJsExt : `./${withJsExt}`;
@@ -535,12 +526,6 @@ function buildEntryContent(
 
 // ─── Production Entry Generator ────────────────────────────────────────────
 
-// FIX: previously this function returned early for BOTH `deno`/`netlify`
-// (before ever checking `adapter.pkg`) AND for platforms with no `pkg`
-// declared (`vercel`/`cloudflare`) — meaning `require.resolve` was never
-// reached for ANY platform and a missing `hono` install was never caught.
-// Now it simply checks whether the adapter declares a required package and,
-// if so, verifies it's resolvable.
 function checkAdapter(platform: NonNodePlatform): void {
   const adapter = ADAPTERS[platform];
   if (!adapter.pkg) return;
@@ -555,18 +540,10 @@ function checkAdapter(platform: NonNodePlatform): void {
   }
 }
 
-// FIX: cleanup previously only ran inside generateProductionEntry/
-// generateHostingConfig, and neither of those functions is ever called when
-// the selected hosting is 'node' — so switching back to Node left old
-// entry files (api/index.ts, worker.ts, etc.), config files (vercel.json,
-// netlify.toml, wrangler.toml), and platform directories (netlify/, server/)
-// sitting in the repo untouched. This function is the single source of
-// cleanup truth and is called for every hosting selection, including 'node'.
 function cleanupPlatformArtifacts(hosting: Platform, ts: boolean): void {
   const cwd = process.cwd();
   const allPlatforms: NonNodePlatform[] = ['netlify', 'vercel', 'cloudflare', 'deno'];
 
-  // Remove generated entry files for every platform except the selected one.
   for (const platform of allPlatforms) {
     if (platform === hosting) continue;
     const adapter = ADAPTERS[platform];
@@ -581,7 +558,6 @@ function cleanupPlatformArtifacts(hosting: Platform, ts: boolean): void {
     }
   }
 
-  // Remove hosting config files for every platform except the selected one.
   for (const platform of allPlatforms) {
     if (platform === hosting) continue;
     const configFile = HOSTING_CONFIGS[platform].configFile;
@@ -597,8 +573,6 @@ function cleanupPlatformArtifacts(hosting: Platform, ts: boolean): void {
     }
   }
 
-  // Remove platform-specific directories for every platform except the
-  // selected one.
   const platformDirs: Record<NonNodePlatform, string> = {
     netlify: 'netlify',
     vercel: 'api',
@@ -631,9 +605,6 @@ export async function generateProductionEntry(
   const cwd = process.cwd();
   const srcApiDir = apiDir || path.join(cwd, 'src/app/api');
 
-  // FIX: `isTypeScriptProject()` walks the filesystem and its result can't
-  // change within this function call, so it's computed once here instead of
-  // being re-invoked on every loop iteration and again later.
   const ts = isTypeScriptProject();
 
   cleanupPlatformArtifacts(platform, ts);
@@ -714,6 +685,7 @@ async function generateHostingConfig(
 
     case 'vercel': {
       const config = {
+        buildCommand: 'npm run build',
         rewrites: [
           { source: '/api/(.*)', destination: '/api/index' },
           { source: '/(.*)', destination: '/index.html' }
@@ -742,7 +714,44 @@ binding = "ASSETS"
   }
 }
 
-// ─── GitHub Push ────────────────────────────────────────────────────────────
+// ─── Git Helpers ────────────────────────────────────────────────────────────
+
+interface GitResult {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+/**
+ * Runs a git command and ALWAYS resolves (never rejects on non-zero exit),
+ * capturing stdout/stderr so callers can classify the failure instead of
+ * guessing. Rejects only on true spawn failure (e.g. git not installed).
+ * Pass `inherit: true` to also stream output live for long operations
+ * (push/fetch) while still capturing it for classification.
+ */
+function runGit(args: string[], opts: { inherit?: boolean } = {}): Promise<GitResult> {
+  return new Promise((resolve, reject) => {
+    const child = crossSpawn('git', args, {
+      cwd: process.cwd(),
+      windowsHide: true,
+      stdio: opts.inherit ? ['inherit', 'pipe', 'pipe'] : 'pipe',
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout?.on('data', (chunk) => {
+      const text = chunk.toString();
+      stdout += text;
+      if (opts.inherit) process.stdout.write(text);
+    });
+    child.stderr?.on('data', (chunk) => {
+      const text = chunk.toString();
+      stderr += text;
+      if (opts.inherit) process.stderr.write(text);
+    });
+    child.on('error', (err) => reject(err));
+    child.on('exit', (code) => resolve({ code, stdout, stderr }));
+  });
+}
 
 function getGitConfig(key: string): Promise<string | null> {
   return new Promise((resolve) => {
@@ -759,6 +768,52 @@ function getGitConfig(key: string): Promise<string | null> {
   });
 }
 
+type GitFailureKind = 'auth' | 'not-found' | 'non-fast-forward' | 'unknown';
+
+/**
+ * Classifies a git stderr blob so we stop treating every push failure as
+ * "diverged history". Auth failures, missing/renamed repos, and genuine
+ * non-fast-forward rejections all need different recovery paths.
+ */
+function classifyGitError(stderr: string): GitFailureKind {
+  const text = stderr.toLowerCase();
+
+  if (
+    text.includes('authentication failed') ||
+    text.includes('could not read username') ||
+    text.includes('could not read password') ||
+    text.includes('terminal prompts disabled') ||
+    text.includes('permission denied') ||
+    text.includes('403')
+  ) {
+    return 'auth';
+  }
+
+  if (
+    text.includes('repository not found') ||
+    text.includes("couldn't find remote ref") ||
+    text.includes('does not exist')
+  ) {
+    return 'not-found';
+  }
+
+  if (
+    text.includes('non-fast-forward') ||
+    text.includes('fetch first') ||
+    text.includes('updates were rejected')
+  ) {
+    return 'non-fast-forward';
+  }
+
+  return 'unknown';
+}
+
+/**
+ * Ensures git user.name/user.email are set (git refuses to commit
+ * otherwise). Prompts interactively when possible; in a non-interactive
+ * context it fails fast with clear instructions instead of letting the
+ * underlying prompt library throw an opaque TTY error.
+ */
 async function ensureGitIdentity(): Promise<void> {
   const [existingName, existingEmail] = await Promise.all([
     getGitConfig('user.name'),
@@ -767,250 +822,322 @@ async function ensureGitIdentity(): Promise<void> {
 
   if (existingName && existingEmail) return;
 
+  if (!isInteractive()) {
+    const missing = [
+      !existingName ? 'user.name' : null,
+      !existingEmail ? 'user.email' : null,
+    ].filter(Boolean).join(' and ');
+    throw new Error(
+      `Git identity is not configured (missing ${missing}) and no terminal is available to prompt for it.\n` +
+      `Configure it first, e.g.:\n` +
+      `  git config --global user.name "Your Name"\n` +
+      `  git config --global user.email "you@example.com"`
+    );
+  }
+
   log.warn('Git author identity is not set - needed to create a commit.');
 
   let gitName = existingName;
   let gitEmail = existingEmail;
 
-  if (!gitName) {
-    gitName = await input({
-      message: 'Your name (for git commits):',
-      validate: (input: string) => input.trim().length > 0 || 'Name is required',
-    });
+  try {
+    if (!gitName) {
+      gitName = await input({
+        message: 'Your name (for git commits):',
+        validate: (v: string) => v.trim().length > 0 || 'Name is required',
+      });
+    }
+
+    if (!gitEmail) {
+      gitEmail = await input({
+        message: 'Your email (for git commits):',
+        validate: (v: string) => /\S+@\S+\.\S+/.test(v) || 'Enter a valid email address',
+      });
+    }
+  } catch (err) {
+    if (isExitPromptError(err)) {
+      throw new Error('Cancelled - a git identity is required to commit.');
+    }
+    throw err;
   }
 
-  if (!gitEmail) {
-    gitEmail = await input({
-      message: 'Your email (for git commits):',
-      validate: (input: string) => /\S+@\S+\.\S+/.test(input) || 'Enter a valid email address',
-    });
-  }
-
+  // Set locally (this repo only) - never silently touches the user's
+  // global git identity.
   if (gitName) {
-    await execAsync('git', ['config', 'user.name', gitName]);
+    const r = await runGit(['config', 'user.name', gitName]);
+    if (r.code !== 0) throw new Error(`Failed to set git user.name:\n${r.stderr.trim()}`);
   }
   if (gitEmail) {
-    await execAsync('git', ['config', 'user.email', gitEmail]);
+    const r = await runGit(['config', 'user.email', gitEmail]);
+    if (r.code !== 0) throw new Error(`Failed to set git user.email:\n${r.stderr.trim()}`);
   }
+
+  log.success('Git identity configured for this repository.');
 }
 
-async function execAsync(cmd: string, args: string[]): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const child = crossSpawn(cmd, args, {
-      stdio: 'inherit',
+/**
+ * Called only after a push has actually failed with an auth-classified
+ * error. Prompts for a GitHub username + Personal Access Token (GitHub no
+ * longer accepts account passwords for git over HTTPS) and stores it via
+ * git's own credential store - the same mechanism `git config
+ * credential.helper store` sets up - so future pushes to this host don't
+ * prompt again.
+ */
+async function ensureGitCredentials(githubRepo: string): Promise<void> {
+  if (!isInteractive()) {
+    throw new Error(
+      'GitHub authentication failed and no terminal is available to prompt for credentials.\n' +
+      'Configure credentials first, e.g.:\n' +
+      '  git config --global credential.helper store\n' +
+      '  git push   (enter your GitHub username and a Personal Access Token once - git will remember it)'
+    );
+  }
+
+  log.warn('GitHub rejected the push - authentication is required.');
+  log.info(
+    'GitHub no longer accepts account passwords for git over HTTPS - use a ' +
+    'Personal Access Token instead (GitHub -> Settings -> Developer settings -> ' +
+    'Personal access tokens, with "repo" scope).'
+  );
+
+  let username: string;
+  let token: string;
+
+  try {
+    username = await input({
+      message: 'GitHub username:',
+      validate: (v: string) => v.trim().length > 0 || 'Username is required',
+    });
+
+    token = await password({
+      message: 'GitHub Personal Access Token:',
+      mask: '*',
+      validate: (v: string) => v.trim().length > 0 || 'Token is required',
+    });
+  } catch (err) {
+    if (isExitPromptError(err)) {
+      throw new Error('Cancelled - GitHub credentials are required to push.');
+    }
+    throw err;
+  }
+
+  let host = 'github.com';
+  try {
+    host = new URL(githubRepo).host;
+  } catch {
+    // githubRepo is already validated against GITHUB_URL_REGEX before this
+    // point, so this is unreachable in practice - falls back defensively.
+  }
+
+  const helperResult = await runGit(['config', '--global', 'credential.helper', 'store']);
+  if (helperResult.code !== 0) {
+    throw new Error(`Failed to configure credential.helper:\n${helperResult.stderr.trim()}`);
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const child = crossSpawn('git', ['credential', 'approve'], {
       cwd: process.cwd(),
       windowsHide: true,
+      stdio: ['pipe', 'ignore', 'pipe'],
     });
-    child.on('error', reject);
-    child.on('exit', (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`Command failed with code ${code}`));
-    });
-  });
-}
-
-async function execAsyncWithOutput(cmd: string, args: string[]): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const child = crossSpawn(cmd, args, {
-      cwd: process.cwd(),
-      windowsHide: true,
-    });
-    let output = '';
-    let error = '';
-
-    child.stdout?.on('data', (chunk) => {
-      output += chunk.toString();
-    });
+    let stderr = '';
     child.stderr?.on('data', (chunk) => {
-      error += chunk.toString();
+      stderr += chunk.toString();
     });
-
     child.on('error', reject);
     child.on('exit', (code) => {
-      if (code === 0) resolve(output);
-      else reject(new Error(`Command failed with code ${code}: ${error}`));
+      code === 0 ? resolve() : reject(new Error(`Failed to save credentials: ${stderr.trim()}`));
     });
+    child.stdin?.write(`protocol=https\nhost=${host}\nusername=${username}\npassword=${token}\n\n`);
+    child.stdin?.end();
   });
+
+  log.success("Credentials saved - future pushes to this host won't prompt again.");
 }
+
+// ─── GitHub Push ────────────────────────────────────────────────────────────
 
 async function pushToGitHub(githubRepo: string): Promise<void> {
   const cwd = process.cwd();
-
-  // Check if git is initialized
   const isGitRepo = existsSync(path.join(cwd, '.git'));
+
   if (!isGitRepo) {
     log.info('Initializing git repository...');
-    await execAsync('git', ['init']);
+    // Create the repo already on "main" - avoids the master->main rename
+    // dance entirely for brand-new repos.
+    const initResult = await runGit(['init', '-b', DEFAULT_BRANCH]);
+    if (initResult.code !== 0) {
+      throw new Error(`git init failed:\n${(initResult.stderr || initResult.stdout).trim()}`);
+    }
     log.info(`Setting remote origin: ${githubRepo}`);
-    await execAsync('git', ['remote', 'add', 'origin', githubRepo]);
+    const remoteAddResult = await runGit(['remote', 'add', 'origin', githubRepo]);
+    if (remoteAddResult.code !== 0) {
+      throw new Error(`Failed to add remote 'origin':\n${remoteAddResult.stderr.trim()}`);
+    }
   } else {
-    // Check if remote exists
     let remoteExists = false;
-    try {
-      const remotes = await execAsyncWithOutput('git', ['remote']);
-      if (remotes.includes('origin')) {
-        remoteExists = true;
-        try {
-          const url = await execAsyncWithOutput('git', ['remote', 'get-url', 'origin']);
-          log.info(`Using existing remote: ${url.trim()}`);
-        } catch {
-          log.info('Using existing remote');
-        }
-      }
-    } catch {
-      // No remotes exist
+    const remotesResult = await runGit(['remote']);
+    if (remotesResult.code === 0 && remotesResult.stdout.includes('origin')) {
+      remoteExists = true;
+      const urlResult = await runGit(['remote', 'get-url', 'origin']);
+      log.info(urlResult.code === 0 ? `Using existing remote: ${urlResult.stdout.trim()}` : 'Using existing remote');
     }
 
-    // Only add remote if it doesn't exist
     if (!remoteExists) {
       log.info(`Setting remote origin: ${githubRepo}`);
-      await execAsync('git', ['remote', 'add', 'origin', githubRepo]);
+      const remoteAddResult = await runGit(['remote', 'add', 'origin', githubRepo]);
+      if (remoteAddResult.code !== 0) {
+        throw new Error(`Failed to add remote 'origin':\n${remoteAddResult.stderr.trim()}`);
+      }
     }
-    // If remote exists, NEVER update or change it
+    // If remote exists, NEVER update or change it.
   }
 
-  // Add all files
   log.info('Adding files to git...');
-  await execAsync('git', ['add', '--all']);
+  const addResult = await runGit(['add', '--all']);
+  if (addResult.code !== 0) {
+    throw new Error(`git add failed:\n${addResult.stderr.trim()}`);
+  }
 
   await ensureGitIdentity();
 
-  // Check if there are changes to commit
-  let hasChanges = false;
-  try {
-    const status = await execAsyncWithOutput('git', ['status', '--porcelain']);
-    hasChanges = status.trim().length > 0;
-  } catch {
-    hasChanges = true;
-  }
+  const statusResult = await runGit(['status', '--porcelain']);
+  const hasChanges = statusResult.code === 0 && statusResult.stdout.trim().length > 0;
 
   if (hasChanges) {
     log.info('Committing changes...');
-    try {
-      await execAsync('git', ['commit', '-m', 'chore: add deployment configuration']);
+    const commitResult = await runGit(['commit', '-m', 'chore: add deployment configuration']);
+    if (commitResult.code === 0) {
       log.success('Changes committed');
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      if (msg.includes('nothing to commit')) {
-        log.info('No changes to commit');
-      } else {
-        log.warn('Failed to commit changes, continuing...');
-      }
+    } else if (/nothing to commit/i.test(commitResult.stdout + commitResult.stderr)) {
+      log.info('No changes to commit');
+    } else {
+      log.warn(`Failed to commit changes, continuing...\n${commitResult.stderr.trim()}`);
     }
   } else {
     log.info('No changes to commit');
   }
 
-  // Check if we're on main or need to switch
-  let currentBranch = 'main';
-  try {
-    const branch = await execAsyncWithOutput('git', ['branch', '--show-current']);
-    if (branch.trim()) {
-      currentBranch = branch.trim();
-    }
-  } catch {
-    // If we can't get branch, default to main
-  }
+  // Normalize to "main" - GitHub's default branch is always main.
+  const branchResult = await runGit(['branch', '--show-current']);
+  const currentBranch = branchResult.stdout.trim();
 
-  // If we're on master, rename to main or switch
-  if (currentBranch === 'master') {
-    log.info('Switching from master to main...');
-    try {
-      // Check if main exists locally
-      const mainExists = await execAsyncWithOutput('git', ['branch', '--list', 'main']);
-      if (mainExists.trim()) {
-        // Switch to main
-        await execAsync('git', ['checkout', 'main']);
-      } else {
-        // Rename master to main
-        await execAsync('git', ['branch', '-m', 'master', 'main']);
-      }
-      currentBranch = 'main';
-    } catch (error) {
-      log.warn('Could not switch to main, trying to push anyway...');
+  if (currentBranch && currentBranch !== DEFAULT_BRANCH) {
+    log.info(`Switching from ${currentBranch} to ${DEFAULT_BRANCH}...`);
+    const listResult = await runGit(['branch', '--list', DEFAULT_BRANCH]);
+    if (listResult.stdout.trim()) {
+      await runGit(['checkout', DEFAULT_BRANCH]);
+    } else {
+      await runGit(['branch', '-m', currentBranch, DEFAULT_BRANCH]);
     }
   }
 
-  // Push to remote - ALWAYS use main.
-  // If the remote has commits we don't have locally (e.g. GitHub auto-created
-  // a README when the repo was made), a plain push is rejected as a
-  // non-fast-forward. In that case, fetch + merge the remote history in
-  // (allowing unrelated histories, since a brand-new local repo won't share
-  // a common ancestor with the remote's initial commit) and retry the push
-  // before giving up.
   log.info('Pushing to GitHub...');
 
-  const tryPush = async (): Promise<boolean> => {
-    try {
-      await execAsync('git', ['push', '-u', 'origin', 'main']);
-      return true;
-    } catch {
-      try {
-        await execAsync('git', ['push', '-u', 'origin', 'HEAD:main']);
-        return true;
-      } catch {
-        return false;
-      }
-    }
-  };
+  const attemptPush = () => runGit(['push', '-u', 'origin', `HEAD:${DEFAULT_BRANCH}`], { inherit: true });
 
-  if (await tryPush()) {
+  let result = await attemptPush();
+
+  if (result.code === 0) {
     log.success('Push successful');
     return;
+  }
+
+  let kind = classifyGitError(result.stderr);
+
+  // Auth failure: prompt once for credentials and retry, instead of
+  // crashing or silently misreporting it as a merge conflict.
+  if (kind === 'auth') {
+    await ensureGitCredentials(githubRepo);
+    result = await attemptPush();
+    if (result.code === 0) {
+      log.success('Push successful');
+      return;
+    }
+    kind = classifyGitError(result.stderr);
+    if (kind === 'auth') {
+      throw new Error(
+        `Push still failed after configuring credentials - double-check the token has 'repo' scope and hasn't expired.\n` +
+        `Raw git error:\n${result.stderr.trim()}`
+      );
+    }
+  }
+
+  if (kind === 'not-found') {
+    throw new Error(
+      `Push failed: repository not found at '${githubRepo}'.\n` +
+      `  - Confirm the repository exists and the URL is correct\n` +
+      `  - Confirm your account has push access to it\n` +
+      `Raw git error:\n${result.stderr.trim()}`
+    );
+  }
+
+  // Anything that isn't a real non-fast-forward rejection: surface the raw
+  // git error directly instead of forcing it through the merge-recovery
+  // path (which was masking real failures like auth/network/repo issues).
+  if (kind !== 'non-fast-forward') {
+    throw new Error(
+      `Push failed:\n${result.stderr.trim() || result.stdout.trim() || 'Unknown git error.'}`
+    );
   }
 
   log.warn('Push rejected - the remote has commits that are not present locally.');
   log.info('Attempting to fetch and merge remote changes...');
 
-  try {
-    await execAsync('git', ['fetch', 'origin', 'main']);
-    try {
-      // NOTE: -X ours is intentional and must stay. When the same file
-      // differs between local and remote, the local version is kept and the
-      // remote version is discarded for that file. Files that only exist on
-      // the remote (and don't conflict with anything local) are still
-      // merged in as usual. We surface a warning right before running it so
-      // this trade-off is visible in the console output, not just in code
-      // comments.
-      log.warn(
-        'Merging remote history with -X ours: for any file that exists both ' +
-        'locally and on the remote, your local version will be kept and the ' +
-        'remote version discarded. Files that only exist on the remote are ' +
-        'still merged in normally.'
-      );
-      await execAsync('git', [
-        'merge',
-        'origin/main',
-        '--allow-unrelated-histories',
-        '-X',
-        'ours',
-        '-m',
-        'chore: merge remote changes',
-      ]);
-    } catch (mergeError) {
-      log.error('Automatic merge failed, likely due to conflicting files (e.g. README.md).');
-      log.error('Resolve the conflicts manually, then run:');
-      log.error('  git add .');
-      log.error('  git commit');
-      log.error('  git push -u origin main');
-      throw mergeError;
-    }
-
-    if (await tryPush()) {
-      log.success('Push successful after merging remote changes');
-      return;
-    }
-
-    throw new Error('Push still failed after merging remote changes');
-  } catch (error) {
-    log.error('Failed to push to GitHub');
-    const msg = error instanceof Error ? error.message : String(error);
-    log.error(`Error: ${msg}`);
-    log.error('You can resolve this manually by running:');
-    log.error('  git pull origin main --allow-unrelated-histories -X ours');
-    log.error('  git push -u origin main');
-    throw error;
+  const fetchResult = await runGit(['fetch', 'origin', DEFAULT_BRANCH]);
+  if (fetchResult.code !== 0) {
+    throw new Error(
+      `Failed to fetch '${DEFAULT_BRANCH}' from origin.\n` +
+      `Raw git error:\n${fetchResult.stderr.trim()}`
+    );
   }
+
+  // NOTE: -X ours is intentional and must stay. When the same file
+  // differs between local and remote, the local version is kept and the
+  // remote version is discarded for that file. Files that only exist on
+  // the remote (and don't conflict with anything local) are still merged
+  // in as usual.
+  log.warn(
+    'Merging remote history with -X ours: for any file that exists both ' +
+    'locally and on the remote, your local version will be kept and the ' +
+    'remote version discarded. Files that only exist on the remote are ' +
+    'still merged in normally.'
+  );
+
+  const mergeResult = await runGit([
+    'merge',
+    `origin/${DEFAULT_BRANCH}`,
+    '--allow-unrelated-histories',
+    '-X',
+    'ours',
+    '-m',
+    'chore: merge remote changes',
+  ]);
+
+  if (mergeResult.code !== 0) {
+    throw new Error(
+      'Automatic merge failed, likely due to conflicting files (e.g. README.md).\n' +
+      'Resolve the conflicts manually, then run:\n' +
+      '  git add .\n' +
+      '  git commit\n' +
+      `  git push -u origin ${DEFAULT_BRANCH}\n\n` +
+      `Raw git error:\n${mergeResult.stderr.trim()}`
+    );
+  }
+
+  result = await attemptPush();
+  if (result.code === 0) {
+    log.success('Push successful after merging remote changes');
+    return;
+  }
+
+  throw new Error(
+    'Push still failed after merging remote changes.\n' +
+    'You can resolve this manually by running:\n' +
+    `  git pull origin ${DEFAULT_BRANCH} --allow-unrelated-histories -X ours\n` +
+    `  git push -u origin ${DEFAULT_BRANCH}\n\n` +
+    `Raw git error:\n${result.stderr.trim()}`
+  );
 }
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
@@ -1088,25 +1215,20 @@ async function getAnswersInteractive(): Promise<DeployAnswers> {
     });
   }
 
-  // Check if git remote already exists
   let githubRepo = '';
   const isGitRepo = existsSync(path.join(process.cwd(), '.git'));
 
   if (isGitRepo) {
-    try {
-      // Try to get existing remote URL
-      const remotes = await execAsyncWithOutput('git', ['remote']);
-      if (remotes.includes('origin')) {
-        const url = await execAsyncWithOutput('git', ['remote', 'get-url', 'origin']);
-        githubRepo = url.trim();
+    const remotesResult = await runGit(['remote']);
+    if (remotesResult.code === 0 && remotesResult.stdout.includes('origin')) {
+      const urlResult = await runGit(['remote', 'get-url', 'origin']);
+      if (urlResult.code === 0) {
+        githubRepo = urlResult.stdout.trim();
         log.info(`Using existing git remote: ${githubRepo}`);
       }
-    } catch {
-      // No remote found, will ask user
     }
   }
 
-  // Only ask for GitHub URL if no remote exists
   if (!githubRepo) {
     githubRepo = await input({
       message: 'Enter your GitHub repository URL:',
@@ -1188,29 +1310,25 @@ async function executeDeployment(answers: DeployAnswers): Promise<void> {
         log.info(`Generated ${path.relative(process.cwd(), configPath)}`);
       }
     } else if (platform === 'web') {
-      // webHosting is 'node' (or unset, which defaults to 'node' — see
-      // getAnswersFromFlags/getAnswersInteractive). Neither generator above
-      // runs in this branch, so cleanup has to be triggered explicitly here
-      // or switching back to Node would silently leave old entry files,
-      // config files, and directories from a previously selected platform.
       spinner.text = 'Cleaning up old platform artifacts...';
       cleanupPlatformArtifacts('node', isTypeScriptProject());
     }
 
     if (platform !== 'web') {
-      // Native platforms (windows/macos/ios/linux/android) never need web
-      // hosting config either — if the project previously targeted, say,
-      // Vercel or Cloudflare, those leftover entry files/config files/
-      // directories would otherwise sit in the repo indefinitely.
       spinner.text = `Preparing ${platform} for deployment...`;
       cleanupPlatformArtifacts('node', isTypeScriptProject());
       log.info(`No configuration needed for ${platform} - pushing existing files to GitHub`);
     }
 
     spinner.text = 'Pushing to GitHub...';
+    // Stop the spinner before git push/prompts take over stdout - the
+    // spinner and inherited git/inquirer output fight over the terminal
+    // line otherwise, which can look like the process "just closed" while
+    // it's actually still running.
+    spinner.stop();
     await pushToGitHub(githubRepo);
 
-    spinner.succeed('All files generated and pushed to GitHub');
+    log.success('All files generated and pushed to GitHub');
 
     console.log(`\n${chalk.cyan.bold('  --- Deployment Complete ---')}`);
     console.log(`  ${chalk.gray('Platform:')}  ${answers.platform}`);
@@ -1221,7 +1339,7 @@ async function executeDeployment(answers: DeployAnswers): Promise<void> {
 
     showNextSteps(answers);
   } catch (error) {
-    spinner.fail('Deployment failed');
+    if (spinner.isSpinning) spinner.fail('Deployment failed');
     const message = error instanceof Error ? error.message : String(error);
     log.error(message);
     throw error;
@@ -1297,10 +1415,19 @@ async function deployCLI(): Promise<void> {
     console.log(`  ${chalk.gray('Repository:')} ${chalk.cyan(answers.githubRepo)}`);
 
     if (!answers.skipPrompts && isInteractive()) {
-      const confirmed = await confirm({
-        message: 'Generate deployment files and push to GitHub?',
-        default: true,
-      });
+      let confirmed: boolean;
+      try {
+        confirmed = await confirm({
+          message: 'Generate deployment files and push to GitHub?',
+          default: true,
+        });
+      } catch (err) {
+        if (isExitPromptError(err)) {
+          log.info('Deployment cancelled.');
+          return;
+        }
+        throw err;
+      }
 
       if (!confirmed) {
         log.info('Deployment cancelled.');
@@ -1318,8 +1445,25 @@ async function deployCLI(): Promise<void> {
 
 // ─── Main Entry ─────────────────────────────────────────────────────────────
 
-const isMainModule =
-  process.argv[1] !== undefined && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+// FIX: package managers (npm, yarn, and especially pnpm) install CLI bins
+// as symlinks in node_modules/.bin. process.argv[1] is the unresolved
+// symlink path, while import.meta.url reflects the file Node actually
+// loaded after following the symlink - so a plain path.resolve() compare
+// mismatches and isMainModule was silently false whenever this ran through
+// a devDependency/.bin invocation (npm run <script>, npx, etc). That made
+// deployCLI() never get called: no prompts, no error, no output, just an
+// immediate clean exit. realpathSync() resolves both sides to the same
+// real filesystem path regardless of how many symlink layers sit between
+// them (pnpm in particular nests these through its content-addressable
+// store).
+const isMainModule = (() => {
+  if (!process.argv[1]) return false;
+  try {
+    return fileURLToPath(import.meta.url) === realpathSync(process.argv[1]);
+  } catch {
+    return false;
+  }
+})();
 
 if (isMainModule) {
   deployCLI().catch((error: unknown) => {
