@@ -19,7 +19,10 @@
 - **File-based API routing** — drop files in `src/app/api/`, `bini-deploy` scans them and mounts each one as a route (dynamic segments and catch-alls included).
 - **Automatic CORS** — API routes get permissive CORS headers out of the box on every non-Node hosting adapter (Netlify, Vercel, Cloudflare, Deno), so your frontend can call them without extra setup.
 - **Native platform support** — Windows, macOS, Linux, iOS, and Android via Tauri/Capacitor, with tailored next-step instructions for each.
-- **Git push built in** — initializes the repo if needed, commits, and pushes, so `bini-deploy` is genuinely one command from zero to deployed.
+- **Git push built in** — initializes the repo if needed, sets up git identity and authentication if they're missing, commits, and pushes, so `bini-deploy` is genuinely one command from zero to deployed.
+- **Automatic git identity setup** — if `user.name`/`user.email` aren't configured, `bini-deploy` prompts for them once and sets them for the repository (never touches your global git config).
+- **Automatic GitHub authentication** — if a push is rejected because GitHub doesn't recognize your credentials, `bini-deploy` prompts for a username and Personal Access Token and saves it via git's own credential store, so you're not dropped into a raw git auth error and future pushes to that host won't prompt again.
+- **Clear, specific push failures** — a rejected push is diagnosed (bad credentials, repository not found, or genuinely diverged history) instead of being treated as one generic case, so you get an accurate error and the right recovery step every time.
 - **Interactive or scriptable** — walk through prompts, or skip them entirely with flags for CI.
 - **Automatic platform cleanup** — removes old configuration files and directories left over from a previously selected platform, every time you deploy — including when you switch back to Node or to a native platform (Windows/macOS/iOS/Linux/Android), neither of which need any web hosting config.
 - **Always pushes to main** — automatically handles branch naming, never pushes to master.
@@ -152,14 +155,12 @@ export default app;
 - **New projects** — If no remote exists, `bini-deploy` adds the provided URL as `origin`
 - **No remote updates** — Once a remote is set, it is never changed or updated
 - **Always main** — `bini-deploy` always pushes to the `main` branch, automatically renaming `master` to `main` if needed
+- **Git identity** — If `user.name`/`user.email` aren't set, you're prompted for them once; they're set locally for the repository, not globally. In a non-interactive run with no identity configured, `bini-deploy` fails fast with the exact `git config` commands to run instead of crashing.
+- **GitHub authentication** — If a push is rejected because GitHub doesn't accept your credentials, you're prompted for a GitHub username and a Personal Access Token (GitHub no longer accepts account passwords for git over HTTPS). The credential is saved via git's own credential store, so subsequent pushes to that host won't prompt again.
 - **Remote-ahead recovery** — If the push is rejected because the remote has commits you don't have locally (e.g. GitHub auto-created a README when the repo was made), `bini-deploy` fetches and merges the remote history in automatically using `--allow-unrelated-histories -X ours`. This keeps your local version of any file that exists on both sides and only pulls in files that are new on the remote — a warning is printed before the merge runs so this trade-off is never silent. If the merge hits a real conflict it can't resolve this way, it stops and prints the manual recovery steps.
+- **Accurate failure diagnostics** — a failed push is classified (bad credentials, repository not found, or a genuine non-fast-forward rejection) so the merge-recovery flow above only runs when it's actually the right fix — other failures are reported with the real underlying git error instead.
 
 This ensures you can run `bini-deploy` multiple times without accidentally pushing to the wrong repository.
-
-## Troubleshooting
-
-**Build fails with `Cannot read properties of undefined (reading 'readFile')`**
-Your `typescript` dependency resolved to TypeScript 7.x, which shipped as a full Go-native rewrite without a public compiler API (that lands in 7.1). Build tools that call into the classic API — including some hosting-provider build pipelines — break on it. Pin `typescript` to a `^6.x` release in `package.json` rather than using `"latest"`.
 
 ## Requirements
 
