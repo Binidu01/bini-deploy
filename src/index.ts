@@ -86,7 +86,7 @@ const ADAPTERS: Record<NonNodePlatform, AdapterConfig> = {
 };
 
 const HOSTING_CONFIGS: Record<Platform, { label: string; configFile: string | null }> = {
-  node: { label: 'Node.js (default — bini-server)', configFile: null },
+  node: { label: 'Node', configFile: null },
   netlify: { label: 'Netlify', configFile: 'netlify.toml' },
   vercel: { label: 'Vercel', configFile: 'vercel.json' },
   cloudflare: { label: 'Cloudflare Workers', configFile: 'wrangler.toml' },
@@ -394,13 +394,28 @@ function buildRouteImports(
 
 // ─── Entry Content Builder ─────────────────────────────────────────────────
 
+// NOTE: the regexes below live inside template-literal strings, so the
+// backslash is doubled (`\\.`). A single `\.` would be emitted as just `.`
+// and the generated code would match any character.
+
 function getDenoSpaFallback(): string[] {
   return [
+    `// Serve the build's real 404.html (falls back to plain text if missing)`,
+    `const notFound = async () => {`,
+    `  try {`,
+    `    const page = await Deno.readFile('./dist/404.html');`,
+    `    return new Response(page, { status: 404, headers: { 'Content-Type': 'text/html' } });`,
+    `  } catch {`,
+    `    return new Response('File not found', { status: 404 });`,
+    `  }`,
+    `};`,
+    ``,
     `// Serve static files from dist (must come AFTER API routes)`,
     `app.get('/*', async (c) => {`,
     `  if (c.req.path.startsWith('/api/')) {`,
     `    return c.text('API route not found', 404);`,
     `  }`,
+    `  const hasExt = /\\.[a-zA-Z0-9]+$/.test(c.req.path);`,
     `  const filePath = c.req.path === '/' ? '/index.html' : c.req.path;`,
     `  try {`,
     `    const file = await Deno.readFile(\`./dist\${filePath}\`);`,
@@ -410,21 +425,29 @@ function getDenoSpaFallback(): string[] {
     `      'css': 'text/css',`,
     `      'js': 'application/javascript',`,
     `      'json': 'application/json',`,
+    `      'txt': 'text/plain',`,
+    `      'xml': 'application/xml',`,
+    `      'svg': 'image/svg+xml',`,
+    `      'ico': 'image/x-icon',`,
+    `      'webmanifest': 'application/manifest+json',`,
+    `      'woff2': 'font/woff2',`,
     `      'png': 'image/png',`,
     `      'jpg': 'image/jpeg',`,
     `      'jpeg': 'image/jpeg'`,
-    `    }[ext] || 'text/plain';`,
+    `    }[ext] || 'application/octet-stream';`,
     `    return new Response(file, {`,
     `      headers: { 'Content-Type': contentType }`,
     `    });`,
     `  } catch {`,
+    `    // Missing file with an extension (robots.txt, ai-catalog.json...) => real 404`,
+    `    if (hasExt) return notFound();`,
     `    try {`,
     `      const indexHtml = await Deno.readFile('./dist/index.html');`,
     `      return new Response(indexHtml, {`,
     `        headers: { 'Content-Type': 'text/html' }`,
     `      });`,
     `    } catch {`,
-    `      return c.text('File not found', 404);`,
+    `      return notFound();`,
     `    }`,
     `  }`,
     `});`,
@@ -433,16 +456,16 @@ function getDenoSpaFallback(): string[] {
 
 function getCloudflareSpaFallback(): string[] {
   return [
-    `// SPA fallback - serves index.html for all non-API, non-asset requests`,
+    `// SPA fallback - only extension-less paths get index.html`,
     `app.get('*', async (c) => {`,
     `  const request = c.req.raw;`,
     `  const env = c.env;`,
     `  const assetResponse = await env.ASSETS.fetch(request);`,
-    `  if (assetResponse.status === 200) {`,
-    `    return assetResponse;`,
+    `  if (assetResponse.status !== 404) return assetResponse;`,
+    `  if (/\\.[a-zA-Z0-9]+$/.test(c.req.path) || c.req.path.startsWith('/api/')) {`,
+    `    return assetResponse; // genuine 404 (serves the build's 404.html)`,
     `  }`,
-    `  const indexHtml = await env.ASSETS.fetch(new URL('/index.html', request.url));`,
-    `  return indexHtml;`,
+    `  return env.ASSETS.fetch(new URL('/index.html', request.url));`,
     `});`,
   ];
 }
@@ -665,6 +688,11 @@ async function generateHostingConfig(
 
   switch (hosting) {
     case 'netlify': {
+      // netlify.toml redirects can't do regex/negation, so the old
+      // `/* -> /index.html` rule can't exclude paths with file extensions.
+      // Instead, the SPA fallback lives in a tiny edge function that only
+      // rewrites to index.html when the response is a 404 AND the path has
+      // no extension (so missing robots.txt, ai-catalog.json, etc. stay 404).
       const config = `
 [build]
   command = "npm run build"
@@ -673,13 +701,61 @@ async function generateHostingConfig(
 [[edge_functions]]
   path = "/api/*"
   function = "api"
-
-[[redirects]]
-  from = "/*"
-  to = "/index.html"
-  status = 200
 `;
       await writeFile(outFile, config.trim());
+
+      const ts = isTypeScriptProject();
+      const edgeDir = path.join(cwd, 'netlify', 'edge-functions');
+      mkdirSync(edgeDir, { recursive: true });
+
+      // Remove a stale fallback with the other extension so it can't run twice.
+      const staleFallback = path.join(edgeDir, ts ? 'spa-fallback.js' : 'spa-fallback.ts');
+      if (existsSync(staleFallback)) {
+        try {
+          unlinkSync(staleFallback);
+        } catch {
+          // Ignore if file can't be removed
+        }
+      }
+
+      const fallbackBody = ts
+        ? `// Auto-generated by bini-deploy - do not edit.
+import type { Context } from 'https://edge.netlify.com';
+
+export default async (request: Request, context: Context) => {
+  const response = await context.next();
+  const { pathname } = new URL(request.url);
+  const isPage =
+    (request.method === 'GET' || request.method === 'HEAD') &&
+    !/\\.[a-zA-Z0-9]+$/.test(pathname);
+  if (response.status === 404 && isPage) {
+    return context.rewrite('/index.html');
+  }
+  return response;
+};
+
+export const config = { path: '/*', excludedPath: ['/api/*'] };
+`
+        : `// Auto-generated by bini-deploy - do not edit.
+export default async (request, context) => {
+  const response = await context.next();
+  const { pathname } = new URL(request.url);
+  const isPage =
+    (request.method === 'GET' || request.method === 'HEAD') &&
+    !/\\.[a-zA-Z0-9]+$/.test(pathname);
+  if (response.status === 404 && isPage) {
+    return context.rewrite('/index.html');
+  }
+  return response;
+};
+
+export const config = { path: '/*', excludedPath: ['/api/*'] };
+`;
+
+      await writeFile(
+        path.join(edgeDir, ts ? 'spa-fallback.ts' : 'spa-fallback.js'),
+        fallbackBody,
+      );
       return outFile;
     }
 
@@ -688,8 +764,10 @@ async function generateHostingConfig(
         buildCommand: 'npm run build',
         rewrites: [
           { source: '/api/(.*)', destination: '/api/index' },
-          { source: '/(.*)', destination: '/index.html' }
-        ]
+          // Anything WITHOUT a file extension gets index.html; missing files
+          // like robots.txt or ai-catalog.json stay a real 404.
+          { source: '/((?!.*\\.[a-zA-Z0-9]+$).*)', destination: '/index.html' },
+        ],
       };
       await writeFile(outFile, JSON.stringify(config, null, 2));
       return outFile;
@@ -704,6 +782,7 @@ compatibility_date = "2025-04-09"
 [assets]
 directory = "./dist"
 binding = "ASSETS"
+not_found_handling = "404-page"
 `;
       await writeFile(outFile, config.trim());
       return outFile;
