@@ -95,7 +95,7 @@ bini-deploy
 |----------|---------|-----------------|
 | **Node.js** (default) | Node (`bini-server`) | None - `bini-server` handles build/serve, `bini-deploy` just pushes to GitHub |
 | **Netlify** | Edge Functions (Deno) | `netlify.toml`, `netlify/edge-functions/spa-fallback.ts`, and `netlify/edge-functions/api.ts` (API entry) |
-| **Vercel** | Node.js Runtime | `vercel.json` and `api/index.ts` (API entry) |
+| **Vercel** | Node.js Runtime | `vercel.json`, `api/index.ts` (API entry), and `api/tsconfig.json` (TypeScript projects only) |
 | **Cloudflare Workers** | Workers | `wrangler.toml` and `worker.ts` (API entry + SPA fallback) |
 | **Deno Deploy** | Deno | `server/index.ts` (API entry + static file server + SPA fallback) - no config file |
 
@@ -103,6 +103,7 @@ Notes:
 
 - **API entry files** (`api.ts`, `api/index.ts`, `worker.ts`, `server/index.ts`) are only generated when `src/app/api/` exists and contains at least one route. Otherwise that step is skipped with a warning. The extension is `.ts` for TypeScript projects and `.js` otherwise (this also applies to Netlify's `spa-fallback`, which is always generated).
 - Node is the default because Bini.js ships with `bini-server`, a zero-dependency production server (`npm run build && npm start`). Choosing it skips config generation entirely - `bini-deploy` just cleans up and pushes.
+- On Vercel, `api/tsconfig.json` extends your root `tsconfig.json` with `types: []` and `skipLibCheck: true`. Vercel's function builder type-checks `api/*.ts` a second time using the nearest tsconfig, and this stops it from failing to resolve project-level types such as `node` or `vite/client`. Your own type check is unaffected.
 - Cloudflare's generated `wrangler.toml` always points `main` at `worker.ts`, and expects a `dist` build output.
 
 ## Static files, SPA fallback, and 404s

@@ -770,6 +770,27 @@ export const config = { path: '/*', excludedPath: ['/api/*'] };
         ],
       };
       await writeFile(outFile, JSON.stringify(config, null, 2));
+
+      // Vercel's function builder re-checks api/*.ts using the nearest
+      // tsconfig. Give it its own so it doesn't try to load project-level
+      // `types` (e.g. 'node', 'vite/client'), which can fail with TS2688.
+      // Project type checking is unaffected - the root tsconfig is untouched.
+      if (isTypeScriptProject()) {
+        const apiDir = path.join(cwd, 'api');
+        mkdirSync(apiDir, { recursive: true });
+        await writeFile(
+          path.join(apiDir, 'tsconfig.json'),
+          JSON.stringify(
+            {
+              extends: '../tsconfig.json',
+              compilerOptions: { types: [], skipLibCheck: true },
+            },
+            null,
+            2,
+          ) + '\n',
+        );
+      }
+
       return outFile;
     }
 
