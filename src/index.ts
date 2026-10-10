@@ -112,8 +112,9 @@ const WEB_NEXT_STEPS: Record<Platform, string[]> = {
   ],
   cloudflare: [
     `Install Wrangler: ${chalk.yellow('npm install -g wrangler')}`,
-    `Run: ${chalk.yellow('wrangler deploy')}`,
-    `Your worker handles API routes`,
+    `Run: ${chalk.yellow('npm run build')} then ${chalk.yellow('wrangler deploy')}`,
+    `If you use Workers Builds, the Worker name in the dashboard must match ${chalk.yellow('name')} in ${chalk.yellow('wrangler.toml')}`,
+    `Your worker handles ${chalk.cyan('/api/*')} routes`,
   ],
   deno: [
     `Connect your repo to ${chalk.cyan('Deno Deploy')}`,
@@ -152,6 +153,21 @@ function norm(p: string): string {
 
 function toPosixPath(filePath: string): string {
   return filePath.replace(/\\/g, '/');
+}
+
+/**
+ * Cloudflare Worker names may only contain lowercase letters, digits and
+ * dashes (max 63 chars). GitHub repo names can contain uppercase letters and
+ * underscores, so derive a valid name instead of passing the repo name through.
+ */
+function toWorkerName(name: string): string {
+  const cleaned = name
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 63)
+    .replace(/-+$/g, '');
+  return cleaned || 'my-app';
 }
 
 function isTypeScriptProject(): boolean {
@@ -398,6 +414,16 @@ function buildRouteImports(
 // backslash is doubled (`\\.`). A single `\.` would be emitted as just `.`
 // and the generated code would match any character.
 
+/**
+ * Deno Deploy serves the whole app through Hono, so it has to mimic what
+ * static hosts do natively:
+ *   - /about            -> dist/about/index.html   (the prerendered page)
+ *   - /blog/123         -> nearest parent shell (dist/blog/index.html) if SSG
+ *                          marked it with __BINI_SHELL__
+ *   - anything else     -> dist/404.html with a real 404 status
+ * The SPA index.html is ONLY used for "/" - never as a catch-all, otherwise
+ * unknown routes get the home page and hydrate into the client-side 404.
+ */
 function getDenoSpaFallback(): string[] {
   return [
     `// Serve the build's real 404.html (falls back to plain text if missing)`,
@@ -410,62 +436,94 @@ function getDenoSpaFallback(): string[] {
     `  }`,
     `};`,
     ``,
+    `const contentTypes = {`,
+    `  html: 'text/html',`,
+    `  css: 'text/css',`,
+    `  js: 'application/javascript',`,
+    `  mjs: 'application/javascript',`,
+    `  json: 'application/json',`,
+    `  txt: 'text/plain',`,
+    `  xml: 'application/xml',`,
+    `  svg: 'image/svg+xml',`,
+    `  ico: 'image/x-icon',`,
+    `  webmanifest: 'application/manifest+json',`,
+    `  woff: 'font/woff',`,
+    `  woff2: 'font/woff2',`,
+    `  png: 'image/png',`,
+    `  jpg: 'image/jpeg',`,
+    `  jpeg: 'image/jpeg',`,
+    `  webp: 'image/webp',`,
+    `  avif: 'image/avif',`,
+    `  gif: 'image/gif',`,
+    `};`,
+    ``,
+    `const tryRead = async (p) => {`,
+    `  try {`,
+    `    return await Deno.readFile('./dist' + p);`,
+    `  } catch {`,
+    `    return null;`,
+    `  }`,
+    `};`,
+    ``,
+    `const htmlResponse = (body) =>`,
+    `  new Response(body, { headers: { 'Content-Type': 'text/html' } });`,
+    ``,
     `// Serve static files from dist (must come AFTER API routes)`,
     `app.get('/*', async (c) => {`,
-    `  if (c.req.path.startsWith('/api/')) {`,
+    `  let pathname = c.req.path;`,
+    `  if (pathname.startsWith('/api/')) {`,
     `    return c.text('API route not found', 404);`,
     `  }`,
-    `  const hasExt = /\\.[a-zA-Z0-9]+$/.test(c.req.path);`,
-    `  const filePath = c.req.path === '/' ? '/index.html' : c.req.path;`,
     `  try {`,
-    `    const file = await Deno.readFile(\`./dist\${filePath}\`);`,
-    `    const ext = filePath.split('.').pop();`,
-    `    const contentType = {`,
-    `      'html': 'text/html',`,
-    `      'css': 'text/css',`,
-    `      'js': 'application/javascript',`,
-    `      'json': 'application/json',`,
-    `      'txt': 'text/plain',`,
-    `      'xml': 'application/xml',`,
-    `      'svg': 'image/svg+xml',`,
-    `      'ico': 'image/x-icon',`,
-    `      'webmanifest': 'application/manifest+json',`,
-    `      'woff2': 'font/woff2',`,
-    `      'png': 'image/png',`,
-    `      'jpg': 'image/jpeg',`,
-    `      'jpeg': 'image/jpeg'`,
-    `    }[ext] || 'application/octet-stream';`,
-    `    return new Response(file, {`,
-    `      headers: { 'Content-Type': contentType }`,
-    `    });`,
+    `    pathname = decodeURIComponent(pathname);`,
     `  } catch {`,
-    `    // Missing file with an extension (robots.txt, ai-catalog.json...) => real 404`,
-    `    if (hasExt) return notFound();`,
-    `    try {`,
-    `      const indexHtml = await Deno.readFile('./dist/index.html');`,
-    `      return new Response(indexHtml, {`,
-    `        headers: { 'Content-Type': 'text/html' }`,
-    `      });`,
-    `    } catch {`,
-    `      return notFound();`,
+    `    return notFound();`,
+    `  }`,
+    `  if (pathname.includes('..') || pathname.includes('\\\\')) return notFound();`,
+    ``,
+    `  // Paths with a file extension: serve the file as-is, otherwise a real 404`,
+    `  if (/\\.[a-zA-Z0-9]+$/.test(pathname)) {`,
+    `    const file = await tryRead(pathname);`,
+    `    if (!file) return notFound();`,
+    `    const ext = pathname.split('.').pop();`,
+    `    return new Response(file, {`,
+    `      headers: { 'Content-Type': contentTypes[ext] || 'application/octet-stream' },`,
+    `    });`,
+    `  }`,
+    ``,
+    `  // Extensionless paths: the prerendered page dist/<route>/index.html`,
+    `  // ("/" resolves to dist/index.html)`,
+    `  const clean = pathname.replace(/\\/+$/, '');`,
+    `  const page = await tryRead(clean + '/index.html');`,
+    `  if (page) return htmlResponse(page);`,
+    ``,
+    `  // Dynamic routes (/blog/123): use the nearest parent shell written by`,
+    `  // bini-ssg (marked with __BINI_SHELL__). Never fall back to the home page.`,
+    `  const parts = clean.split('/').filter(Boolean);`,
+    `  while (parts.length > 1) {`,
+    `    parts.pop();`,
+    `    const shell = await tryRead('/' + parts.join('/') + '/index.html');`,
+    `    if (shell && new TextDecoder().decode(shell).includes('__BINI_SHELL__')) {`,
+    `      return htmlResponse(shell);`,
     `    }`,
     `  }`,
+    ``,
+    `  // Unknown route: the prerendered 404.html with a real 404 status`,
+    `  return notFound();`,
     `});`,
   ];
 }
 
 function getCloudflareSpaFallback(): string[] {
   return [
-    `// SPA fallback - only extension-less paths get index.html`,
-    `app.get('*', async (c) => {`,
-    `  const request = c.req.raw;`,
-    `  const env = c.env;`,
-    `  const assetResponse = await env.ASSETS.fetch(request);`,
-    `  if (assetResponse.status !== 404) return assetResponse;`,
-    `  if (/\\.[a-zA-Z0-9]+$/.test(c.req.path) || c.req.path.startsWith('/api/')) {`,
-    `    return assetResponse; // genuine 404 (serves the build's 404.html)`,
+    `// Only /api/* reaches this Worker (run_worker_first in wrangler.toml).`,
+    `// Everything else is served by Workers Static Assets, including the`,
+    `// prerendered pages and the real 404.html.`,
+    `app.all('*', async (c) => {`,
+    `  if (c.req.path.startsWith('/api/')) {`,
+    `    return c.json({ error: 'API route not found' }, 404);`,
     `  }`,
-    `  return env.ASSETS.fetch(new URL('/index.html', request.url));`,
+    `  return c.env.ASSETS.fetch(c.req.raw);`,
     `});`,
   ];
 }
@@ -795,17 +853,26 @@ export const config = { path: '/*', excludedPath: ['/api/*'] };
     }
 
     case 'cloudflare': {
+      const ts = isTypeScriptProject();
+      const workerName = toWorkerName(projectName);
+
+      // - `main` must match the file the adapter actually wrote (worker.ts vs
+      //   worker.js).
+      // - `not_found_handling = "404-page"` makes Cloudflare serve 404.html for
+      //   any unmatched path WITHOUT invoking the Worker, so /api/* has to be
+      //   forced through the Worker with `run_worker_first`.
       const config = `
-name = "${projectName}"
-main = "worker.ts"
+name = "${workerName}"
+main = "${ts ? 'worker.ts' : 'worker.js'}"
 compatibility_date = "2025-04-09"
 
 [assets]
 directory = "./dist"
 binding = "ASSETS"
 not_found_handling = "404-page"
+run_worker_first = ["/api/*"]
 `;
-      await writeFile(outFile, config.trim());
+      await writeFile(outFile, config.trim() + '\n');
       return outFile;
     }
 

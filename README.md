@@ -17,7 +17,7 @@
 
 - **Web hosting, generated for you** - Netlify, Vercel, Cloudflare Workers, or Deno Deploy. Picks the right adapter, writes the config file, and wires up your API routes automatically.
 - **File-based API routing** - drop files in `src/app/api/`, `bini-deploy` scans them and mounts each one as a route (dynamic segments and catch-alls included).
-- **Correct SPA fallback and real 404s** - extension-less paths (`/about`, `/dashboard/settings`) fall back to `index.html`, while missing files (`robots.txt`, `ai-catalog.json`, `favicon.ico`…) return a genuine `404` - using the `404.html` your build produces - instead of being answered with `index.html`.
+- **Prerendered pages and real 404s** - on Cloudflare and Deno Deploy, pages prerendered by `bini-ssg` (`/about` → `dist/about/index.html`) are served directly, and unknown routes return your build's real `404.html` with a genuine `404` status instead of the home page. Missing files (`robots.txt`, `ai-catalog.json`, `favicon.ico`…) also return a genuine `404` on every host.
 - **Automatic CORS** - API routes get permissive CORS headers (`Access-Control-Allow-Origin: *`) out of the box on every non-Node hosting adapter (Netlify, Vercel, Cloudflare, Deno), so your frontend can call them without extra setup.
 - **Native platform support** - Windows, macOS, Linux, iOS, and Android via Tauri/Capacitor, with tailored next-step instructions for each.
 - **Git push built in** - initializes the repo if needed, sets up git identity and authentication if they're missing, commits, and pushes, so `bini-deploy` is genuinely one command from zero to deployed.
@@ -96,35 +96,35 @@ bini-deploy
 | **Node.js** (default) | Node (`bini-server`) | None - `bini-server` handles build/serve, `bini-deploy` just pushes to GitHub |
 | **Netlify** | Edge Functions (Deno) | `netlify.toml`, `netlify/edge-functions/spa-fallback.ts`, and `netlify/edge-functions/api.ts` (API entry) |
 | **Vercel** | Node.js Runtime | `vercel.json`, `api/index.ts` (API entry), and `api/tsconfig.json` (TypeScript projects only) |
-| **Cloudflare Workers** | Workers | `wrangler.toml` and `worker.ts` (API entry + SPA fallback) |
-| **Deno Deploy** | Deno | `server/index.ts` (API entry + static file server + SPA fallback) - no config file |
+| **Cloudflare Workers** | Workers + Static Assets | `wrangler.toml` and `worker.ts` (API entry, handles `/api/*` only) |
+| **Deno Deploy** | Deno | `server/index.ts` (API entry + static file server for prerendered pages) - no config file |
 
 Notes:
 
 - **API entry files** (`api.ts`, `api/index.ts`, `worker.ts`, `server/index.ts`) are only generated when `src/app/api/` exists and contains at least one route. Otherwise that step is skipped with a warning. The extension is `.ts` for TypeScript projects and `.js` otherwise (this also applies to Netlify's `spa-fallback`, which is always generated).
 - Node is the default because Bini.js ships with `bini-server`, a zero-dependency production server (`npm run build && npm start`). Choosing it skips config generation entirely - `bini-deploy` just cleans up and pushes.
 - On Vercel, `api/tsconfig.json` extends your root `tsconfig.json` with `types: []` and `skipLibCheck: true`. Vercel's function builder type-checks `api/*.ts` a second time using the nearest tsconfig, and this stops it from failing to resolve project-level types such as `node` or `vite/client`. Your own type check is unaffected.
-- Cloudflare's generated `wrangler.toml` always points `main` at `worker.ts`, and expects a `dist` build output.
+- On Cloudflare, the generated `wrangler.toml` points `main` at `worker.ts` (or `worker.js` in JavaScript projects) and expects a `dist` build output. The Worker `name` is derived from your repository name, lowercased and sanitized to letters, digits, and dashes (max 63 characters), because Cloudflare rejects anything else.
 
-## Static files, SPA fallback, and 404s
+## Static files, prerendered pages, and 404s
 
-For a single-page app, "page" URLs should serve `index.html`, but a missing static file should be a real `404` - otherwise `/robots.txt` or `/ai-catalog.json` would silently return HTML. The rule on every generated adapter is the same:
+A missing static file should be a real `404` - otherwise `/robots.txt` or `/ai-catalog.json` would silently return HTML. The hosts differ in how they treat extension-less paths (`/about`, `/dashboard/settings`):
 
-- **Path has a file extension** (`.txt`, `.json`, `.png`, …) and doesn't exist → real `404`, using your build's `404.html` where the host supports it.
-- **Path has no file extension** and doesn't exist → `index.html` (client-side routing takes over).
-- **`/api/*`** → handled by your API routes, never by the SPA fallback.
+- **Path has a file extension** (`.txt`, `.json`, `.png`, …) and doesn't exist → real `404`, using your build's `404.html` where the host supports it. This applies to every host.
+- **`/api/*`** → handled by your API routes, never by a page fallback.
+- **Path has no file extension** → depends on the host, see below.
 
-How each host implements it:
+| Provider | Extension-less paths | Mechanism |
+|----------|----------------------|-----------|
+| **Vercel** | Prerendered page if it exists, otherwise `index.html` (client-side routing takes over) | `vercel.json` rewrites: `/api/(.*)` → `/api/index`, and `/((?!.*\.[a-zA-Z0-9]+$).*)` → `/index.html` (extension-less paths only). Missing files fall through to Vercel's own `404.html` handling. |
+| **Netlify** | Prerendered page if it exists, otherwise `index.html` | `netlify.toml` redirects can't use regex or negation, so there is no `/* → /index.html` redirect. A generated edge function (`spa-fallback.ts`, or `.js` in JavaScript projects) runs on every non-API request and rewrites to `/index.html` only when the response is a `404` **and** the path has no extension. Netlify serves your `404.html` for everything else. Trade-off: that function runs on each non-API request. |
+| **Cloudflare** | Prerendered page if it exists, otherwise the real `404.html` (status 404) | `wrangler.toml` sets `not_found_handling = "404-page"` so Cloudflare serves static assets and `404.html` natively, and `run_worker_first = ["/api/*"]` so only API requests are sent to the Worker. Unknown `/api/*` paths return a JSON `404`. |
+| **Deno Deploy** | Prerendered page if it exists, then the nearest dynamic-route shell, otherwise the real `404.html` (status 404) | The generated server reads from `./dist`: `/about` → `dist/about/index.html`; `/` → `dist/index.html`. For a path like `/blog/123` it walks up to the nearest parent folder whose `index.html` contains the `bini-ssg` shell marker (`__BINI_SHELL__`). Anything else gets `./dist/404.html` with status 404 (plain text if the file doesn't exist). `index.html` is never used as a catch-all. Common content types (`html`, `css`, `js`, `mjs`, `json`, `txt`, `xml`, `svg`, `ico`, `webmanifest`, `woff`, `woff2`, `png`, `jpg`, `webp`, `avif`, `gif`) are set; anything else is `application/octet-stream`. |
+| **Node** | Handled by `bini-server` | |
 
-| Provider | Mechanism |
-|----------|-----------|
-| **Vercel** | `vercel.json` rewrites: `/api/(.*)` → `/api/index`, and `/((?!.*\.[a-zA-Z0-9]+$).*)` → `/index.html` (extension-less paths only). Missing files fall through to Vercel's own `404.html` handling. |
-| **Netlify** | `netlify.toml` redirects can't use regex or negation, so there is no `/* → /index.html` redirect. A generated edge function (`spa-fallback.ts`, or `.js` in JavaScript projects) runs on every non-API request and rewrites to `/index.html` only when the response is a `404` **and** the path has no extension. Netlify serves your `404.html` for everything else. Trade-off: that function runs on each non-API request. |
-| **Cloudflare** | `wrangler.toml` sets `not_found_handling = "404-page"`, so Cloudflare serves your `404.html` natively. The worker falls back to `index.html` only for extension-less paths. |
-| **Deno Deploy** | The generated server reads files from `./dist`, serves `./dist/404.html` (status 404) for missing files with an extension, and `./dist/index.html` for extension-less paths. Falls back to plain text if `404.html` doesn't exist. Common content types (`html`, `css`, `js`, `json`, `txt`, `xml`, `svg`, `ico`, `webmanifest`, `woff2`, `png`, `jpg`) are set; anything else is `application/octet-stream`. |
-| **Node** | Handled by `bini-server`. |
+> **Cloudflare:** don't change `not_found_handling` to `"single-page-application"` - Cloudflare would then serve `index.html` for missing files again, which defeats the rule above. And don't remove `run_worker_first`: with `404-page` enabled, Cloudflare answers unmatched paths with `404.html` **without running your Worker**, so `/api/*` would return the 404 page.
 
-> **Cloudflare:** don't change `not_found_handling` to `"single-page-application"` - Cloudflare would then serve `index.html` for missing files again, which defeats the rule above.
+> **Dynamic routes on Cloudflare and Deno:** `bini-ssg` writes a shell for dynamic patterns at the parent path (for example `/blog/:id` → `dist/blog/index.html`). Deno Deploy serves that shell for `/blog/123`. Cloudflare's static assets only match exact files, so `/blog/123` returns the `404.html` page there. A top-level dynamic route such as `/:id` has no parent shell and returns `404` on both hosts. If you rely on client-only dynamic routes, use Vercel or Netlify, which fall back to `index.html`.
 
 ## API routes
 
@@ -215,12 +215,31 @@ For `windows`, `macos`, `linux`, `ios`, and `android`, no hosting configuration 
 - **Remote-ahead recovery** - if the push is rejected because the remote has commits you don't have (e.g. GitHub auto-created a README), `bini-deploy` fetches `origin/main` and merges with `--allow-unrelated-histories -X ours`. For any file that exists on both sides, **your local version wins and the remote version is discarded**; files that only exist on the remote are merged in. A warning is printed before the merge. If the merge still fails, it stops and prints the manual recovery steps.
 - **Accurate failure diagnostics** - failures are classified as authentication, repository not found, or non-fast-forward; the merge recovery above only runs for the last one. Other failures surface the raw git error.
 
+## Troubleshooting
+
+### Cloudflare: the first deploy fails, the second works
+
+Common causes, in rough order of likelihood. Check the failed build log in the Cloudflare dashboard (Deployments → Build log) to see which one applies:
+
+- **Worker name mismatch.** If you use Workers Builds, the Worker name in the dashboard must match `name` in the generated `wrangler.toml` (your repository name, lowercased and sanitized). A mismatch fails the build until the two agree.
+- **Repository connected before the push.** If you connect the repo in Cloudflare before `bini-deploy` has pushed `wrangler.toml` and `worker.ts`, the first automatic build runs without them. The push then triggers a second build, which succeeds. Run `bini-deploy` first, then connect the repo.
+- **Transient first-deploy errors.** A brand-new Worker with static assets can occasionally fail during asset upload or workers.dev subdomain setup. Retrying the deploy resolves it.
+
+### Cloudflare: `/api/*` shows the 404 page
+
+Your `wrangler.toml` was generated by an older version of `bini-deploy` and lacks `run_worker_first = ["/api/*"]`. Rerun `bini-deploy` to regenerate it and redeploy. This option requires a recent Wrangler version that supports array patterns.
+
+### Deno Deploy: every route hydrates from `index.html`
+
+The generated `server/index.ts` came from an older version of `bini-deploy` that served `index.html` for every extension-less path. Rerun `bini-deploy --generate-entry deno` (or a full deploy) and redeploy.
+
 ## Requirements
 
 - Node.js **>= 18**
 - Vite **>= 6**
 - A GitHub repository to push to (created ahead of time)
 - `git` available on your `PATH`
+- For Cloudflare: a recent Wrangler version (array patterns for `run_worker_first`)
 
 ## Contributing
 
