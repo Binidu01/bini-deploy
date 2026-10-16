@@ -1,8 +1,8 @@
 # bini-deploy
 
-**Zero-config deployment for [Bini.js](https://binijs.com) projects - web, desktop, and mobile, all from one CLI.**
+**Zero-config deployment for [Bini.js](https://bini.js.org) projects: web hosting, or desktop, Android and iOS builds on GitHub Actions, all from one CLI.**
 
-`bini-deploy` scans your project, generates the right hosting configuration for your target platform, and pushes it straight to GitHub. No YAML spelunking, no platform-specific docs to read first.
+`bini-deploy` generates the right configuration for the target you pick, helps you set up code signing for native builds, and pushes everything to a GitHub repository. A single run deploys either **web** or **native** targets (see [One run, one kind of target](#one-run-one-kind-of-target)).
 
 [![npm version](https://img.shields.io/npm/v/bini-deploy.svg)](https://www.npmjs.com/package/bini-deploy)
 [![npm downloads](https://img.shields.io/npm/dm/bini-deploy.svg)](https://www.npmjs.com/package/bini-deploy)
@@ -15,20 +15,26 @@
 
 ## Features
 
-- **Web hosting, generated for you** - Netlify, Vercel, Cloudflare Workers, or Deno Deploy. Picks the right adapter, writes the config file, and wires up your API routes automatically.
-- **File-based API routing** - drop files in `src/app/api/`, `bini-deploy` scans them and mounts each one as a route (dynamic segments and catch-alls included).
-- **Prerendered pages and real 404s** - on Cloudflare and Deno Deploy, pages prerendered by `bini-ssg` (`/about` → `dist/about/index.html`) are served directly, and unknown routes return your build's real `404.html` with a genuine `404` status instead of the home page. Missing files (`robots.txt`, `ai-catalog.json`, `favicon.ico`…) also return a genuine `404` on every host.
-- **Automatic CORS** - API routes get permissive CORS headers (`Access-Control-Allow-Origin: *`) out of the box on every non-Node hosting adapter (Netlify, Vercel, Cloudflare, Deno), so your frontend can call them without extra setup.
-- **Native platform support** - Windows, macOS, Linux, iOS, and Android via Tauri/Capacitor, with tailored next-step instructions for each.
-- **Git push built in** - initializes the repo if needed, sets up git identity and authentication if they're missing, commits, and pushes, so `bini-deploy` is genuinely one command from zero to deployed.
-- **Automatic git identity setup** - if `user.name`/`user.email` aren't configured, `bini-deploy` prompts for them once and sets them for the repository only (never touches your global identity).
-- **Automatic GitHub authentication** - if a push is rejected because of bad or missing credentials, `bini-deploy` prompts for a username and Personal Access Token and saves it through git's credential store, so future pushes to that host won't prompt again.
-- **Clear, specific push failures** - a rejected push is classified (bad credentials, repository not found, or genuinely diverged history) so you get an accurate error and the right recovery step instead of one generic failure.
-- **Interactive or scriptable** - walk through prompts, or skip them entirely with flags for CI.
-- **Automatic platform cleanup** - removes entry files, config files, and directories left over from a previously selected platform every time you deploy, including when you switch back to Node or to a native platform.
-- **Always pushes to main** - never pushes to `master`.
-- **Hono support** - detects Hono apps and mounts them correctly.
-- **Dependency checks** - for adapters that import `hono` as an npm package (Vercel, Cloudflare), verifies it's installed before generating an entry and tells you the exact install command if it's missing. Netlify and Deno Deploy import Hono from a URL, so no local install is required for those.
+- **Web hosting, generated for you** - Netlify, Vercel, Cloudflare Workers, Deno Deploy, or Node. Writes the config file and wires up your API routes.
+- **Native builds on GitHub Actions** - generates `desktop.yml`, `android.yml` and `ios.yml` (Tauri). Builds run on GitHub, so you can deploy iOS without owning a Mac.
+- **File-based API routing** - files in `src/app/api/` are scanned and mounted as routes (dynamic segments and catch-alls included).
+- **Prerendered pages and real 404s** - on Cloudflare and Deno Deploy, pages prerendered by `bini-ssg` are served directly and unknown routes return your build's `404.html` with a real `404` status. Missing files (`robots.txt`, `favicon.ico`...) return a real `404` on every host.
+- **Automatic CORS** - API routes get `Access-Control-Allow-Origin: *` on every non-Node hosting adapter.
+- **Guided code signing** - runs `create-bini-app sign <target> --ci-only` for each platform, then uploads the saved values as GitHub secrets. Windows, Linux and Android can use a self-signed key that the workflow generates once and reuses.
+- **Package-manager aware** - the build command, install step and printed next steps follow your lockfile (npm, pnpm, yarn or bun).
+- **Git push built in** - initializes the repo if needed, sets a local git identity if missing, handles authentication, commits and pushes.
+- **Always pushes to `main`**.
+- **Interactive or scriptable** - prompts by default, or flags plus `--yes` for scripts.
+
+## Requirements
+
+- Node.js **>= 20.19**
+- Vite **>= 6**
+- A GitHub repository to push to (created ahead of time), addressed as `https://github.com/<owner>/<repo>` (see [Git behavior](#git-behavior))
+- `git` on your `PATH`
+- A Bini.js project. For native targets, a Tauri project created by [`create-bini-app`](https://www.npmjs.com/package/create-bini-app) (see [Native builds](#native-builds-desktop-android-ios)). `bini-deploy` calls `create-bini-app` through `npx`.
+- Optional: the GitHub CLI (`gh`), logged in, to upload signing secrets automatically
+- For Cloudflare: a recent Wrangler version (array patterns for `run_worker_first`)
 
 ## Installation
 
@@ -40,15 +46,23 @@ pnpm add -D bini-deploy
 yarn add -D bini-deploy
 ```
 
+Add a script if your project doesn't have one:
+
+```json
+{ "scripts": { "deploy": "bini-deploy" } }
+```
+
 ## Quick start
 
-Interactive mode - just run it and answer the prompts:
+Interactive, just answer the prompts:
 
 ```bash
+npm run deploy
+# or
 npx bini-deploy
 ```
 
-Non-interactive mode - for scripts and CI:
+Non-interactive, for scripts and CI:
 
 ```bash
 npx bini-deploy --platform web --hosting vercel --repo https://github.com/you/your-app --yes
@@ -62,73 +76,82 @@ bini-deploy [options]
 
 | Flag | Description |
 |------|-------------|
-| `--platform <type>` | Target platform: `web`, `windows`, `macos`, `ios`, `linux`, `android` |
-| `--hosting <name>` | Hosting provider (web only): `node` (default with `--yes`), `netlify`, `vercel`, `cloudflare`, `deno` |
+| `--platform <targets>` | `web`, or any of `desktop`, `android`, `ios`, comma-separated (e.g. `desktop,android`). `web` cannot be combined with the others. `windows`, `macos` and `linux` are accepted as aliases for `desktop` (with a warning: one workflow builds all three) |
+| `--hosting <name>` | Hosting provider for web: `node` (default), `netlify`, `vercel`, `cloudflare`, `deno` |
 | `--repo <url>` | GitHub repository URL, e.g. `https://github.com/you/your-app` |
 | `--generate-entry <host>` | Generate the production API entry file only (`netlify`, `vercel`, `cloudflare`, `deno`) |
-| `--yes`, `-y` | Skip interactive prompts and use the flags provided (`--platform` and `--repo` are required) |
-| `--help`, `-h` | Show usage information |
+| `--nosign` | Native only: skip the code signing prompts, the secret upload and the `SECRETS_PAT` check |
+| `--yes`, `-y` | Skip prompts and use the flags (`--platform` and `--repo` are required) |
+| `--help`, `-h` | Show usage |
 
-Without `--yes`, `bini-deploy` needs an interactive terminal (TTY) and exits with an error otherwise. `--hosting` is only used when `--platform` is `web`.
+Without `--yes`, `bini-deploy` needs an interactive terminal and exits with an error otherwise. In interactive mode the prompts decide everything: `--platform`, `--hosting` and `--repo` are only read together with `--yes`. `--nosign` and `--generate-entry` work in both modes.
+
+Exit codes: `0` on success, `1` on an error, `130` when you cancel (Ctrl+C), `143` on `SIGTERM`.
+
+### One run, one kind of target
+
+A run deploys **either** web **or** one or more native targets. Selecting `web` together with `desktop`, `android` or `ios` is rejected in the prompt and by `--platform`. Run `bini-deploy` once for each kind.
+
+> **Order matters.** Deploying native targets removes all web hosting files, and deploying web removes the files of the other hosting providers (see [What cleanup deletes](#what-cleanup-deletes)). If you deploy native after web, commit or back up the hosting files you want to keep.
 
 ### Examples
 
 ```bash
-# Deploy a web app to Vercel, non-interactively
+# Web to Vercel, no prompts
 bini-deploy --platform web --hosting vercel --repo https://github.com/you/your-app --yes
 
-# Deploy a desktop build for Windows
-bini-deploy --platform windows --repo https://github.com/you/your-app -y
+# Desktop, Android and iOS builds
+bini-deploy --platform desktop,android,ios --repo https://github.com/you/your-app -y
 
-# Generate only the Netlify API entry file (useful for debugging)
+# Native, without signing
+bini-deploy --platform desktop --repo https://github.com/you/your-app -y --nosign
+
+# Generate only the Netlify API entry file (no config, no push)
 bini-deploy --generate-entry netlify
 
-# Just run it and follow the prompts
+# Follow the prompts
 bini-deploy
 ```
 
-> `--generate-entry` only writes the API entry file (no hosting config, no git push), but it still runs the platform cleanup described below.
+> `--generate-entry` writes only the API entry file, but it still removes leftover files from other hosting providers (see [What cleanup deletes](#what-cleanup-deletes)).
 
-## Supported hosting providers
+## Web hosting
 
 | Provider | Runtime | Files generated |
 |----------|---------|-----------------|
-| **Node.js** (default) | Node (`bini-server`) | None - `bini-server` handles build/serve, `bini-deploy` just pushes to GitHub |
-| **Netlify** | Edge Functions (Deno) | `netlify.toml`, `netlify/edge-functions/spa-fallback.ts`, and `netlify/edge-functions/api.ts` (API entry) |
-| **Vercel** | Node.js Runtime | `vercel.json`, `api/index.ts` (API entry), and `api/tsconfig.json` (TypeScript projects only) |
-| **Cloudflare Workers** | Workers + Static Assets | `wrangler.toml` and `worker.ts` (API entry, handles `/api/*` only) |
-| **Deno Deploy** | Deno | `server/index.ts` (API entry + static file server for prerendered pages) - no config file |
+| **Node** (default with `--yes`) | Node (`bini-server`) | None. `bini-server` handles build and serve; `bini-deploy` cleans up and pushes |
+| **Netlify** | Edge Functions (Deno) | `netlify.toml`, `netlify/edge-functions/api.ts`, `netlify/edge-functions/spa-fallback.ts` |
+| **Vercel** | Node.js Runtime | `vercel.json`, `api/index.ts`, and `api/tsconfig.json` (TypeScript projects only) |
+| **Cloudflare Workers** | Workers + Static Assets | `wrangler.toml`, `worker.ts` (handles `/api/*` only) |
+| **Deno Deploy** | Deno | `server/index.ts` (API entry and static server for prerendered pages), no config file |
 
 Notes:
 
-- **API entry files** (`api.ts`, `api/index.ts`, `worker.ts`, `server/index.ts`) are only generated when `src/app/api/` exists and contains at least one route. Otherwise that step is skipped with a warning. The extension is `.ts` for TypeScript projects and `.js` otherwise (this also applies to Netlify's `spa-fallback`, which is always generated).
-- Node is the default because Bini.js ships with `bini-server`, a zero-dependency production server (`npm run build && npm start`). Choosing it skips config generation entirely - `bini-deploy` just cleans up and pushes.
-- On Vercel, `api/tsconfig.json` extends your root `tsconfig.json` with `types: []` and `skipLibCheck: true`. Vercel's function builder type-checks `api/*.ts` a second time using the nearest tsconfig, and this stops it from failing to resolve project-level types such as `node` or `vite/client`. Your own type check is unaffected.
-- On Cloudflare, the generated `wrangler.toml` points `main` at `worker.ts` (or `worker.js` in JavaScript projects) and expects a `dist` build output. The Worker `name` is derived from your repository name, lowercased and sanitized to letters, digits, and dashes (max 63 characters), because Cloudflare rejects anything else.
+- API entry files (`api.ts`, `api/index.ts`, `worker.ts`, `server/index.ts`) are only generated when `src/app/api/` exists and has at least one route. Otherwise that step is skipped with a warning. Extensions are `.ts` for TypeScript projects and `.js` otherwise (Netlify's `spa-fallback` follows the same rule).
+- For Vercel and Cloudflare, the generated entry imports `hono` from npm, so deploy checks that it's installed. If it isn't, deploy prints the install command and stops. Netlify and Deno import Hono from a URL, so no local install is needed.
+- The build command written to `netlify.toml` and `vercel.json` uses your package manager (for example `pnpm run build`), detected from your lockfile.
+- On Vercel, `api/tsconfig.json` extends your root `tsconfig.json` with `types: []` and `skipLibCheck: true`, so Vercel's second type-check of `api/*.ts` doesn't fail on project-level types like `node` or `vite/client`.
+- On Cloudflare, the Worker `name` comes from your repository name, lowercased and reduced to letters, digits and dashes (max 63 characters).
 
-## Static files, prerendered pages, and 404s
+### Static files, prerendered pages and 404s
 
-A missing static file should be a real `404` - otherwise `/robots.txt` or `/ai-catalog.json` would silently return HTML. The hosts differ in how they treat extension-less paths (`/about`, `/dashboard/settings`):
+| Provider | Extension-less paths (`/about`) |
+|----------|----------------------------------|
+| **Vercel** | Prerendered page if it exists, otherwise `index.html`. `vercel.json` rewrites `/api/(.*)` to `/api/index`, and extension-less paths to `/index.html`. |
+| **Netlify** | Prerendered page if it exists, otherwise `index.html`. An edge function rewrites to `/index.html` only when the response is a `404` and the path has no extension. It runs on every non-API request. |
+| **Cloudflare** | Prerendered page if it exists, otherwise `404.html` with status 404. `not_found_handling = "404-page"` and `run_worker_first = ["/api/*"]` are set in `wrangler.toml`. |
+| **Deno Deploy** | Prerendered page, then the nearest `bini-ssg` shell (a parent `index.html` containing `__BINI_SHELL__`), otherwise `dist/404.html` with status 404. `index.html` is only used for `/`. |
+| **Node** | Handled by `bini-server` |
 
-- **Path has a file extension** (`.txt`, `.json`, `.png`, …) and doesn't exist → real `404`, using your build's `404.html` where the host supports it. This applies to every host.
-- **`/api/*`** → handled by your API routes, never by a page fallback.
-- **Path has no file extension** → depends on the host, see below.
+Paths with a file extension that don't exist return a real `404` on every host. `/api/*` always goes to your API routes.
 
-| Provider | Extension-less paths | Mechanism |
-|----------|----------------------|-----------|
-| **Vercel** | Prerendered page if it exists, otherwise `index.html` (client-side routing takes over) | `vercel.json` rewrites: `/api/(.*)` → `/api/index`, and `/((?!.*\.[a-zA-Z0-9]+$).*)` → `/index.html` (extension-less paths only). Missing files fall through to Vercel's own `404.html` handling. |
-| **Netlify** | Prerendered page if it exists, otherwise `index.html` | `netlify.toml` redirects can't use regex or negation, so there is no `/* → /index.html` redirect. A generated edge function (`spa-fallback.ts`, or `.js` in JavaScript projects) runs on every non-API request and rewrites to `/index.html` only when the response is a `404` **and** the path has no extension. Netlify serves your `404.html` for everything else. Trade-off: that function runs on each non-API request. |
-| **Cloudflare** | Prerendered page if it exists, otherwise the real `404.html` (status 404) | `wrangler.toml` sets `not_found_handling = "404-page"` so Cloudflare serves static assets and `404.html` natively, and `run_worker_first = ["/api/*"]` so only API requests are sent to the Worker. Unknown `/api/*` paths return a JSON `404`. |
-| **Deno Deploy** | Prerendered page if it exists, then the nearest dynamic-route shell, otherwise the real `404.html` (status 404) | The generated server reads from `./dist`: `/about` → `dist/about/index.html`; `/` → `dist/index.html`. For a path like `/blog/123` it walks up to the nearest parent folder whose `index.html` contains the `bini-ssg` shell marker (`__BINI_SHELL__`). Anything else gets `./dist/404.html` with status 404 (plain text if the file doesn't exist). `index.html` is never used as a catch-all. Common content types (`html`, `css`, `js`, `mjs`, `json`, `txt`, `xml`, `svg`, `ico`, `webmanifest`, `woff`, `woff2`, `png`, `jpg`, `webp`, `avif`, `gif`) are set; anything else is `application/octet-stream`. |
-| **Node** | Handled by `bini-server` | |
+> **Cloudflare:** don't change `not_found_handling` to `"single-page-application"` and don't remove `run_worker_first`. With `404-page` enabled, Cloudflare answers unmatched paths with `404.html` without running your Worker, so `/api/*` would return the 404 page.
 
-> **Cloudflare:** don't change `not_found_handling` to `"single-page-application"` - Cloudflare would then serve `index.html` for missing files again, which defeats the rule above. And don't remove `run_worker_first`: with `404-page` enabled, Cloudflare answers unmatched paths with `404.html` **without running your Worker**, so `/api/*` would return the 404 page.
+> **Dynamic routes on Cloudflare and Deno:** `bini-ssg` writes a shell for dynamic patterns at the parent path (`/blog/:id` becomes `dist/blog/index.html`). Deno serves that shell for `/blog/123`. Cloudflare only matches exact files, so `/blog/123` returns `404.html` there. A top-level dynamic route such as `/:id` has no parent shell and returns `404` on both. For client-only dynamic routes, use Vercel or Netlify.
 
-> **Dynamic routes on Cloudflare and Deno:** `bini-ssg` writes a shell for dynamic patterns at the parent path (for example `/blog/:id` → `dist/blog/index.html`). Deno Deploy serves that shell for `/blog/123`. Cloudflare's static assets only match exact files, so `/blog/123` returns the `404.html` page there. A top-level dynamic route such as `/:id` has no parent shell and returns `404` on both hosts. If you rely on client-only dynamic routes, use Vercel or Netlify, which fall back to `index.html`.
+### API routes
 
-## API routes
-
-Any `.ts` or `.js` file in `src/app/api/` becomes an API route:
+Any `.ts` or `.js` file in `src/app/api/` becomes a route:
 
 ```
 src/app/api/
@@ -140,13 +163,11 @@ src/app/api/
     └── [...slug].ts    → /api/posts/*
 ```
 
-Rules:
+- `index` maps to its folder, `[param]` becomes `:param`, `[...name]` becomes a catch-all `*`.
+- Files and folders starting with `_` or `.` are ignored.
+- Names may only contain letters, numbers, `_` and `-`; param names must be valid identifiers. Anything else is skipped with a warning.
 
-- `index` maps to its folder; `[param]` becomes `:param`; `[...name]` becomes a catch-all `*`.
-- Files and folders starting with `_` or `.` are ignored (handy for helpers).
-- Route and folder names may only contain letters, numbers, `_` and `-`; param names must be valid identifiers. Anything else is skipped with a warning.
-
-Each plain route file should export a default handler that accepts a `Request` and returns a `Response` (or a JSON-serializable value):
+A plain route file exports a default handler that takes a `Request` and returns a `Response` or a JSON-serializable value:
 
 ```typescript
 // src/app/api/users/[id].ts
@@ -156,94 +177,158 @@ export default async function handler(req: Request) {
 }
 ```
 
-Handler errors are caught and returned as `500 { "error": "Internal Server Error" }`.
+Errors thrown by a plain handler are caught and returned as `500 { "error": "Internal Server Error" }`.
 
-> **Note on ESM projects:** if your `package.json` has `"type": "module"` (Bini.js projects do by default), Node's native ESM loader requires every relative import to include its file extension. `bini-deploy` generates its own imports with the correct `.js` extension for Vercel and Cloudflare (and `.ts` for Netlify and Deno), but if your route files import their own local helpers (e.g. `./utils`), include the extension too (`./utils.js`), or the deployed function can crash at invocation with `ERR_MODULE_NOT_FOUND` even though the build succeeds.
+> **ESM projects:** with `"type": "module"` (the Bini.js default), Node requires file extensions on relative imports. `bini-deploy` writes its own imports correctly, but if your route files import local helpers, include the extension (`./utils.js`) or the deployed function can crash with `ERR_MODULE_NOT_FOUND`.
 
-### Hono support
+#### Hono
 
-If a route file imports from `hono`, `bini-deploy` treats it as a Hono app and mounts it with `app.route('/api', yourApp)`. The mount point is always `/api` - **not** the file's path - so define the full sub-path inside your app:
+If a route file imports from `hono`, it's mounted with `app.route('/api', yourApp)`. The mount point is always `/api`, not the file's path, so define the full sub-path inside the app:
 
 ```typescript
 // src/app/api/hello.ts
 import { Hono } from 'hono';
 
 const app = new Hono();
-
 app.get('/hello', (c) => c.json({ message: 'Hello from Hono!' }));
-app.post('/hello', async (c) => {
-  const body = await c.req.json();
-  return c.json({ received: body });
-});
 
 export default app;
 ```
 
-This serves `GET /api/hello` and `POST /api/hello`.
+This serves `GET /api/hello`.
 
-## How it works
+## Native builds (desktop, Android, iOS)
 
-1. **Clean** - removes leftover entry files, config files, and directories from any previously selected platform. This runs no matter what you pick next, including Node or a native platform.
-2. **Scan** - scans `src/app/api/` for route files.
-3. **Generate** - writes the platform-specific entry file and hosting configuration.
-4. **Push** - stages everything, commits, and pushes to your GitHub repository.
-5. **Deploy** - your hosting platform deploys from GitHub.
+Native targets are [Tauri](https://tauri.app) apps built by GitHub Actions. `bini-deploy` writes one workflow per target into `.github/workflows/`:
 
-### What cleanup deletes
+| Target | Workflow | Runner | Output (Artifacts) |
+|--------|----------|--------|--------------------|
+| Desktop | `desktop.yml` | one job each for Windows (`windows-latest`), macOS (`macos-latest`) and Linux (`ubuntu-22.04`) | `src-tauri/target/release/bundle/**`, one artifact per OS (`desktop-Windows`, `desktop-macOS`, `desktop-Linux`) |
+| Android | `android.yml` | `ubuntu-latest` (JDK 17, Android NDK) | `.apk` and `.aab` |
+| iOS | `ios.yml` | `macos-latest` | `.ipa` (a simulator-only build produces none) |
 
-When you deploy to platform X, everything belonging to the *other* platforms is removed:
+Each workflow can be started manually (**Actions > Run workflow**) or by pushing a tag that starts with `v` (for example `git tag v1.0.0 && git push --tags`). Builds are downloaded from the **Artifacts** section of the run. Workflows are regenerated every time you deploy, so don't edit them by hand. They use Node 22 and a pinned Rust toolchain, pin every GitHub Action to an exact version, cancel an older run of the same workflow on the same ref, and time out after 60 minutes.
 
-- their generated entry files and config files (`netlify.toml`, `vercel.json`, `wrangler.toml`), and
-- their whole directories: **`netlify/`**, **`api/`** (Vercel), and **`server/`** (Deno) - each deleted recursively unless it belongs to the platform you selected.
+The workflows install dependencies with your package manager (`npm ci`, `pnpm install --frozen-lockfile`, `bun install --frozen-lockfile`, or yarn's frozen/immutable install when there is a lockfile) and build with the scripts that `create-bini-app` adds to `package.json`: `tauri:build`, `android:build` and `ios:build`.
 
-If your project has its own `api/` or `server/` folder with unrelated code, move it before running `bini-deploy`.
+### Before you deploy
 
-### Native platforms
+Deploy does **not** create the native project. It requires:
 
-For `windows`, `macos`, `linux`, `ios`, and `android`, no hosting configuration is generated; `bini-deploy` cleans up, pushes, and prints next steps. Those steps assume your project already defines these scripts and tooling:
+- `src-tauri/tauri.conf.json`, and
+- the build script for each selected target in `package.json` (`tauri:build`, `android:build`, `ios:build`).
 
-- Desktop (Tauri): `npm run tauri:dev` and `npm run build:<platform>`
-- Mobile (Capacitor): `npx cap add <platform>` and `npm run build:<platform>`
+If either is missing, deploy stops and tells you to run `npx create-bini-app@<version> add <target>`. Both come from `create-bini-app add`: the first native target creates `src-tauri/` and adds all the native scripts. On Windows and Linux, run `add desktop` to get that shared setup; the iOS project itself is generated in CI.
 
-### Git behavior
+If `src-tauri/gen/android` or `src-tauri/gen/apple` isn't in your repository, the workflow generates it on the runner (`tauri android init --ci` / `tauri ios init --ci`), using the identifier and app name from your `tauri.conf.json`.
 
-- **Existing remote** - if the project already has an `origin`, it's used as-is and never changed. Otherwise the provided URL is added as `origin`.
-- **Staging** - `git add --all` stages **everything** in the working tree, so make sure your `.gitignore` is correct. The commit message is `chore: add deployment configuration`.
-- **Always main** - the push is `git push -u origin HEAD:main`. If you're on another branch, `bini-deploy` checks out `main` if it exists, otherwise renames the current branch to `main`. New repositories are created with `git init -b main`.
-- **Git identity** - if `user.name`/`user.email` aren't set, you're prompted once; they're stored in this repository's local config. In a non-interactive run with no identity, `bini-deploy` fails fast and prints the exact `git config` commands to run.
-- **GitHub authentication** - if the push fails with an authentication error, you're prompted for a GitHub username and a Personal Access Token (with `repo` scope; GitHub no longer accepts account passwords over HTTPS). To remember it, `bini-deploy` runs `git config --global credential.helper store` and saves the credential with `git credential approve`. Note this is a **global** setting and the `store` helper keeps credentials in plain text in `~/.git-credentials`. If you'd rather use another helper (Git Credential Manager, macOS Keychain, …), configure it beforehand.
-- **Remote-ahead recovery** - if the push is rejected because the remote has commits you don't have (e.g. GitHub auto-created a README), `bini-deploy` fetches `origin/main` and merges with `--allow-unrelated-histories -X ours`. For any file that exists on both sides, **your local version wins and the remote version is discarded**; files that only exist on the remote are merged in. A warning is printed before the merge. If the merge still fails, it stops and prints the manual recovery steps.
-- **Accurate failure diagnostics** - failures are classified as authentication, repository not found, or non-fast-forward; the merge recovery above only runs for the last one. Other failures surface the raw git error.
+### What happens when you deploy a native target
+
+1. **Project check** - `src-tauri/tauri.conf.json` and the build scripts must exist (see above). Web hosting files are removed (see [What cleanup deletes](#what-cleanup-deletes)), and the signing files are added to `.gitignore` so secrets are never committed.
+2. **Code signing prompts** - skipped with `--nosign`, `--yes`, or without a terminal (deploy then only warns about targets that have no saved signing values). Otherwise, for every platform being deployed, you are asked whether to set up signing now (or set it up again, if values already exist). Saying yes runs, with the terminal handed over to it:
+
+   ```
+   npx --yes create-bini-app@<bini-deploy version> sign <target> --ci-only
+   ```
+
+   Desktop covers three targets (`windows`, `macos`, `linux`), Android and iOS one each. The values are saved to `.env.signing`. `create-bini-app` is pinned to the same version as `bini-deploy`, so a new release can't change your CI silently. Skipped targets still build in CI, just unsigned (ad-hoc signed on macOS, simulator-only on iOS).
+3. **Workflows are generated** and everything is committed and pushed.
+4. **Secrets are uploaded** to the repository with the GitHub CLI (see below).
+5. **`SECRETS_PAT` is checked** when any generated key is in use (see below).
+
+`--nosign` skips steps 2, 4 and 5.
+
+### Signing secrets
+
+Values saved in `.env.signing` are uploaded as repository secrets with the names below, and the workflows read them. Only the values that exist are uploaded. They are sent to `gh` over stdin and never printed.
+
+| Target | Secrets |
+|--------|---------|
+| Windows | `WINDOWS_CERTIFICATE`, `WINDOWS_CERTIFICATE_PASSWORD`, `WINDOWS_PUBLISHER` |
+| macOS | `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `KEYCHAIN_PASSWORD`, `APPLE_API_ISSUER`, `APPLE_API_KEY`, `APPLE_API_KEY_P8`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` |
+| Linux | `GPG_PRIVATE_KEY`, `SIGN_KEY`, `APPIMAGETOOL_SIGN_PASSPHRASE`, `APPIMAGETOOL_FORCE_SIGN`, `LINUX_PUBLISHER`, `TAURI_SIGNING_RPM_KEY`, `TAURI_SIGNING_RPM_KEY_PASSPHRASE` |
+| Android | `ANDROID_KEY_BASE64`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_PUBLISHER` |
+| iOS | `IOS_CERTIFICATE`, `IOS_CERTIFICATE_PASSWORD`, `IOS_MOBILE_PROVISION`, `APPLE_DEVELOPMENT_TEAM`, `APPLE_API_ISSUER`, `APPLE_API_KEY`, `APPLE_API_KEY_P8` |
+
+`APPLE_API_KEY_PATH` (a local path) is never uploaded. Signing files (`.env.signing`, `.bini-signing/`, `*.jks`, `*.keystore`, `*.p12`, `*.pfx`, `*.p8`, `*.mobileprovision`, `*.key`, `keystore.properties`, `tauri.windows.conf.json`, `tauri.macos.conf.json`) are added to `.gitignore` before anything is committed.
+
+**GitHub CLI:** the upload needs `gh` installed and logged in (`gh auth status`). Deploy does not install it or log in for you. If `gh` is missing or logged out, deploy prints the repository's secrets page and the secret names to add by hand, and carries on. In an interactive run you are asked to confirm the upload first; with `--yes` it uploads without asking when `gh` is logged in.
+
+**`SECRETS_PAT` and generated keys.** Windows, Linux and Android can use a self-signed key that the workflow creates on the first build (when `.env.signing` holds `WINDOWS_PUBLISHER`, `LINUX_PUBLISHER` or `ANDROID_PUBLISHER` and no real credentials). To reuse it later, the workflow saves it as a GitHub secret, which needs a repository secret named `SECRETS_PAT`: a fine-grained token for this repository with **Secrets: Read and write**. Without it, a new key is created on every build, and the workflow prints a warning if saving fails. After the upload, deploy checks for `SECRETS_PAT` with `gh secret list` and, in an interactive run, offers to add it from a token you paste. Otherwise it prints how to add it by hand. macOS and iOS cannot be generated.
+
+### Per-platform behavior in CI
+
+For each platform the workflow uses, in order: real or saved credentials from secrets, then a generated self-signed key (Windows, Linux, Android), then nothing.
+
+- **Windows** - imports your `.pfx` into the certificate store and signs with it. With only `WINDOWS_PUBLISHER`, it creates a self-signed certificate for that publisher. With a cloud or hardware key set up through `sign --sign-command` (`src-tauri/tauri.cloud-sign.conf.json`), the build uses that config, and the workflow installs the signing tool it recognizes from the command: Azure Artifact Signing (`artifact-signing-cli`), Azure Key Vault (`relic`), SSL.com eSigner (`CodeSignTool`) or `jsign`. For any other tool it prints a warning, and you must add the install step yourself. With none of these, the build is unsigned.
+- **macOS** - signs with your Developer ID certificate when `APPLE_CERTIFICATE` and its password exist, and notarizes when an App Store Connect API key or Apple ID credentials were saved. Otherwise it uses an ad-hoc signature.
+- **Linux** - imports your GPG key (or generates one for `LINUX_PUBLISHER`, without a passphrase) and signs both the AppImage and the RPM. A signing failure fails the build instead of producing an unsigned AppImage. With no key, both are unsigned.
+- **Android** - uses your keystore (`ANDROID_KEY_BASE64`), or creates one for `ANDROID_PUBLISHER` with `ANDROID_KEYSTORE_PASSWORD`, then wires Gradle with `create-bini-app sign android`. With neither, the release build is unsigned.
+- **iOS** - with certificate, password and provisioning profile it builds an `app-store-connect` export. With an App Store Connect API key and a team ID it uses Xcode automatic signing. Without either it builds for the simulator only.
+
+## What cleanup deletes
+
+Every deploy runs a cleanup step before it generates anything, including native deploys and `--generate-entry`.
+
+When you deploy web to hosting provider X, everything belonging to the *other* providers is removed:
+
+- their generated entry and config files (`netlify.toml`, `vercel.json`, `wrangler.toml`), and
+- their directories: **`netlify/`**, **`api/`** (Vercel) and **`server/`** (Deno), each deleted recursively.
+
+Choosing **Node**, or deploying any **native** target, removes all of them. If your project has its own `api/` or `server/` folder with unrelated code, move it before running `bini-deploy`.
+
+## Git behavior
+
+- **Repository URL** - must look like `https://github.com/<owner>/<repo>` (letters, digits, `_` and `-` only, no `.git` suffix, no trailing slash, no SSH URLs), or deploy stops with "Invalid GitHub repository URL". In an interactive run, an existing `origin` is read and used without asking, so a remote written as `.../repo.git` fails this check: set it to the plain form first.
+- **Existing remote** - an existing `origin` is used as-is and never changed. Otherwise the repository URL is added as `origin`.
+- **Staging** - `git add --all` stages everything, so check your `.gitignore`. The commit message is `chore: add deployment configuration`.
+- **Always `main`** - the push is `git push -u origin HEAD:main`. On another branch, deploy checks out `main` if it exists, otherwise renames the current branch. New repositories are created with `git init -b main`.
+- **Git identity** - if `user.name` or `user.email` aren't set, you're prompted once and they're stored in this repository's local config only. Without a terminal it fails fast and prints the `git config` commands to run.
+- **Authentication** - if the push fails with an auth error, you're prompted for a GitHub username and a Personal Access Token and it's saved through git's credential store. The token needs the `repo` scope, plus the **`workflow`** scope to push `.github/workflows` files. This runs `git config --global credential.helper store`, a **global** setting that keeps credentials in plain text in `~/.git-credentials`. If you prefer another helper (Git Credential Manager, macOS Keychain), configure it beforehand.
+- **Remote ahead** - if the push is rejected because the remote has commits you don't (for example an auto-created README), deploy fetches `origin/main` and merges with `--allow-unrelated-histories -X ours`. For any file on both sides, **your local version wins**; files that only exist remotely are merged in. A warning is printed first. If the merge fails, it stops and prints the manual steps.
+- **Failure classification** - failures are reported as authentication, repository not found, or non-fast-forward. Only the last triggers the merge recovery. Others show the raw git error.
 
 ## Troubleshooting
 
+### Native: "No Tauri project found" or a missing script
+
+Deploy needs `src-tauri/tauri.conf.json` and the `tauri:build`, `android:build` or `ios:build` script. Run `npx create-bini-app@latest add <desktop|android|ios>` first, then deploy again. On Windows or Linux, `add desktop` creates the shared setup that iOS builds in CI also need.
+
+### Native: the workflow can't be pushed
+
+Your token is missing the `workflow` scope. Create a new Personal Access Token with `repo` and `workflow` and run deploy again.
+
+### Native: secrets weren't uploaded
+
+The GitHub CLI is missing or not logged in. Install it, run `gh auth login`, then run deploy again. You can also add the secrets by hand at `https://github.com/<you>/<repo>/settings/secrets/actions`.
+
+### Native: a new signing key is created on every build
+
+The workflow can't save the generated key because `SECRETS_PAT` is missing or its token lacks **Secrets: Read and write** for this repository. Add it at `https://github.com/<you>/<repo>/settings/secrets/actions`, or run deploy again and accept the prompt.
+
+### Native: a platform builds unsigned
+
+No signing values were saved for it. Run `npx create-bini-app@latest sign <target> --ci-only` (or answer yes to the prompt on the next deploy) and deploy again so the secrets are uploaded. macOS and iOS need real Apple credentials; they cannot be generated.
+
 ### Cloudflare: the first deploy fails, the second works
 
-Common causes, in rough order of likelihood. Check the failed build log in the Cloudflare dashboard (Deployments → Build log) to see which one applies:
+Check the Cloudflare build log (Deployments > Build log). Common causes:
 
-- **Worker name mismatch.** If you use Workers Builds, the Worker name in the dashboard must match `name` in the generated `wrangler.toml` (your repository name, lowercased and sanitized). A mismatch fails the build until the two agree.
-- **Repository connected before the push.** If you connect the repo in Cloudflare before `bini-deploy` has pushed `wrangler.toml` and `worker.ts`, the first automatic build runs without them. The push then triggers a second build, which succeeds. Run `bini-deploy` first, then connect the repo.
-- **Transient first-deploy errors.** A brand-new Worker with static assets can occasionally fail during asset upload or workers.dev subdomain setup. Retrying the deploy resolves it.
+- **Worker name mismatch** - with Workers Builds, the dashboard's Worker name must match `name` in `wrangler.toml`.
+- **Repository connected before the push** - run `bini-deploy` first, then connect the repo, otherwise the first build runs without `wrangler.toml` and `worker.ts`.
+- **Transient first-deploy errors** - a new Worker with static assets can fail during asset upload; retrying resolves it.
 
 ### Cloudflare: `/api/*` shows the 404 page
 
-Your `wrangler.toml` was generated by an older version of `bini-deploy` and lacks `run_worker_first = ["/api/*"]`. Rerun `bini-deploy` to regenerate it and redeploy. This option requires a recent Wrangler version that supports array patterns.
+Your `wrangler.toml` lacks `run_worker_first = ["/api/*"]`. Rerun `bini-deploy` to regenerate it and redeploy.
 
 ### Deno Deploy: every route hydrates from `index.html`
 
-The generated `server/index.ts` came from an older version of `bini-deploy` that served `index.html` for every extension-less path. Rerun `bini-deploy --generate-entry deno` (or a full deploy) and redeploy.
-
-## Requirements
-
-- Node.js **>= 18**
-- Vite **>= 6**
-- A GitHub repository to push to (created ahead of time)
-- `git` available on your `PATH`
-- For Cloudflare: a recent Wrangler version (array patterns for `run_worker_first`)
+The generated `server/index.ts` is from an older version. Run `bini-deploy --generate-entry deno` (or a full deploy) and redeploy.
 
 ## Contributing
 
-Issues and pull requests are welcome. If you're adding a new hosting provider, extend `ADAPTERS` and `HOSTING_CONFIGS` and add a case to `generateHostingConfig` in `src/index.ts` - the config-driven structure means most providers only need a new entry, not new branching logic.
+Issues and pull requests are welcome. To add a hosting provider, extend `ADAPTERS`, `HOSTING_CONFIGS` and `WEB_NEXT_STEPS`, and add a case to `generateHostingConfig` in `src/index.ts`. For native targets, the workflow builders (`buildDesktopWorkflow`, `buildAndroidWorkflow`, `buildIosWorkflow`) and the signing secret lists (`SIGNING_SECRETS`) are the places to change.
 
 ```bash
 git clone https://github.com/Binidu01/bini-deploy

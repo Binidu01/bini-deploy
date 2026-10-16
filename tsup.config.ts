@@ -11,7 +11,7 @@ export default defineConfig({
   platform: 'node',
   outDir: 'dist',
   external: [
-    '@inquirer/prompts',  
+    '@clack/prompts',
     'chalk',
     'cross-spawn',
     'ora',
