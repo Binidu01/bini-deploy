@@ -1112,6 +1112,9 @@ function setupSteps(info: PackageManagerInfo): string[] {
 const installStep = (info: PackageManagerInfo): string =>
   `- name: Install dependencies\n  run: ${installCommand(info)}`;
 
+const iconStep = (pm: PackageManager): string =>
+  `- name: Generate app icons\n  run: ${scriptCommand(pm, 'tauri:icon')}`;
+
 function rustSteps(targets?: string[]): string[] {
   const toolchain = targets?.length
     ? `- name: Install Rust\n  uses: ${ACTIONS.rustToolchain}\n  with:\n    targets: ${targets.join(',')}`
@@ -1281,8 +1284,11 @@ function macosSignScript(): string {
 
 const LINUX_SIGN_SCRIPT = [
   `key_id=''`,
+  `rpm_armored=''`,
   `if [ -n "$GPG_PRIVATE_KEY" ]; then`,
   `  echo "$GPG_PRIVATE_KEY" | base64 --decode | gpg --batch --import`,
+  `  echo "$GPG_PRIVATE_KEY" | base64 --decode > "$RUNNER_TEMP/rpm-signing-key.asc"`,
+  `  rpm_armored="$RUNNER_TEMP/rpm-signing-key.asc"`,
   `  key_id="$SIGN_KEY"`,
   `elif [ -n "$LINUX_PUBLISHER" ]; then`,
   `  name="$LINUX_PUBLISHER"`,
@@ -1291,6 +1297,8 @@ const LINUX_SIGN_SCRIPT = [
   `  gpg --batch --pinentry-mode loopback --gen-key "$RUNNER_TEMP/gpg-batch"`,
   `  rm -f "$RUNNER_TEMP/gpg-batch"`,
   `  key_id="$(gpg --list-secret-keys --with-colons --keyid-format LONG | awk -F: '/^sec:/ {print $5; exit}')"`,
+  `  gpg --batch --armor --export-secret-keys "$key_id" > "$RUNNER_TEMP/rpm-signing-key.asc"`,
+  `  rpm_armored="$RUNNER_TEMP/rpm-signing-key.asc"`,
   `  echo "Created a GPG key for $LINUX_PUBLISHER."`,
   `  if [ -n "$GH_TOKEN" ]; then`,
   `    gpg --batch --armor --export-secret-keys "$key_id" | base64 -w0 > "$RUNNER_TEMP/gpg.b64"`,
@@ -1317,7 +1325,13 @@ const LINUX_SIGN_SCRIPT = [
   `  echo "APPIMAGETOOL_SIGN_PASSPHRASE=$APPIMAGETOOL_SIGN_PASSPHRASE" >> "$GITHUB_ENV"`,
   `  echo "TAURI_SIGNING_RPM_KEY_PASSPHRASE=$APPIMAGETOOL_SIGN_PASSPHRASE" >> "$GITHUB_ENV"`,
   `fi`,
-  `if [ -n "$GPG_PRIVATE_KEY" ]; then echo "TAURI_SIGNING_RPM_KEY=$GPG_PRIVATE_KEY" >> "$GITHUB_ENV"; fi`,
+  `if [ -n "$rpm_armored" ] && [ -f "$rpm_armored" ]; then`,
+  `  {`,
+  `    echo "TAURI_SIGNING_RPM_KEY<<EOF"`,
+  `    cat "$rpm_armored"`,
+  `    echo "EOF"`,
+  `  } >> "$GITHUB_ENV"`,
+  `fi`,
 ].join('\n');
 
 function buildDesktopWorkflow(info: PackageManagerInfo): string {
@@ -1338,6 +1352,7 @@ function buildDesktopWorkflow(info: PackageManagerInfo): string {
     sudo apt-get update
     sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev`,
     installStep(info),
+    iconStep(pm),
     `- name: Configure Windows signing
   if: runner.os == 'Windows'
   shell: pwsh
@@ -1446,6 +1461,7 @@ function buildAndroidWorkflow(info: PackageManagerInfo): string {
     if [ ! -d src-tauri/gen/android ]; then
       ${scriptCommand(pm, 'tauri', ['android', 'init', '--ci'])}
     fi`,
+    iconStep(pm),
     `- name: Configure Android signing
   env:
 ${indent(secretEnv(['ANDROID_KEY_BASE64', 'ANDROID_KEY_ALIAS', 'ANDROID_PUBLISHER']), 4)}
@@ -1497,6 +1513,7 @@ function buildIosWorkflow(info: PackageManagerInfo): string {
     if [ ! -d src-tauri/gen/apple ]; then
       ${scriptCommand(pm, 'tauri', ['ios', 'init', '--ci'])}
     fi`,
+    iconStep(pm),
     `- name: Build iOS app
   env:
 ${indent(secretEnv(['IOS_CERTIFICATE', 'IOS_CERTIFICATE_PASSWORD', 'IOS_MOBILE_PROVISION', 'APPLE_DEVELOPMENT_TEAM', 'APPLE_API_ISSUER', 'APPLE_API_KEY', 'APPLE_API_KEY_P8']), 4)}
@@ -1588,6 +1605,7 @@ const SIGNING_GITIGNORE = [
   '.bini-signing/',
   'tauri.windows.conf.json',
   'tauri.macos.conf.json',
+  'tauri.ios.conf.json',
   '*.jks',
   '*.keystore',
   '*.p12',
@@ -1758,14 +1776,17 @@ async function ensureSigning(targets: NativePlatform[], skipPrompts: boolean): P
       continue;
     }
 
+    if (signed) {
+      log.skip(`${label}: signing already configured, skipping the prompt.`);
+      continue;
+    }
+
     const run = await confirm({
-      message: signed
-        ? `${label} signing is already set up. Set it up again?`
-        : `${label}: set up signing for GitHub Actions now?`,
-      default: !signed,
+      message: `${label}: set up signing for GitHub Actions now?`,
+      default: true,
     });
     if (!run) {
-      if (!signed) log.skip(`${label}. CI will build it unsigned.`);
+      log.skip(`${label}. CI will build it unsigned.`);
       continue;
     }
 
@@ -2343,6 +2364,7 @@ ${c.heading('Native targets:')}
   Everything in .env.signing is uploaded as GitHub secrets with the GitHub CLI.
   Windows cloud signing (Azure Artifact Signing, Azure Key Vault/relic, SSL.com eSigner, jsign) is detected
   from tauri.cloud-sign.conf.json and the matching CLI is installed by the generated workflow.
+  App icons are regenerated from public/logo.png before every build.
 
 ${c.heading('Examples:')}
 ${[
