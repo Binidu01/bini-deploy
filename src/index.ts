@@ -1542,7 +1542,7 @@ function buildIosWorkflow(info: PackageManagerInfo): string {
   const pm = info.pm;
 
   const signedBuild = scriptCommand(pm, NATIVE_BUILD_SCRIPTS.ios, ['--export-method', 'app-store-connect']);
-  const simulatorBuild = scriptCommand(pm, NATIVE_BUILD_SCRIPTS.ios, ['--target', 'aarch64-sim', '--debug']);
+  const simulatorBuild = scriptCommand(pm, NATIVE_BUILD_SCRIPTS.ios, ['--target', 'aarch64-sim']);
 
   const steps: string[] = [
     ...setupSteps(info),
@@ -1601,7 +1601,8 @@ ${indent(secretEnv(['IOS_CERTIFICATE', 'IOS_CERTIFICATE_PASSWORD', 'IOS_MOBILE_P
       echo "::error title=No .app found::The simulator build produced no .app bundle."
       exit 1
     fi
-    ditto -c -k --keepParent "$app" "$GITHUB_WORKSPACE/ios-simulator.zip"`,
+    cd "$(dirname "$app")"
+    zip -r -y "$GITHUB_WORKSPACE/ios-simulator.zip" "$(basename "$app")"`,
     `- name: Upload simulator build
   if: steps.build.outputs.signed == 'false'
   uses: ${ACTIONS.uploadArtifact}
