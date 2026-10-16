@@ -181,15 +181,6 @@ const API_EXTS = ['.ts', '.js'] as const;
 
 const DEFAULT_BRANCH = 'main';
 
-const BINI_DEPLOY_VERSION: string = (() => {
-  try {
-    return (require('../package.json') as { version?: string }).version ?? 'latest';
-  } catch {
-    return 'latest';
-  }
-})();
-const CREATE_BINI_APP_PIN = `create-bini-app@${BINI_DEPLOY_VERSION}`;
-
 const ACTIONS = {
   checkout: 'actions/checkout@v4.2.2',
   setupNode: 'actions/setup-node@v4.1.0',
@@ -1406,6 +1397,11 @@ jobs:
 const ANDROID_SIGN_SCRIPT = [
   `keystore="$RUNNER_TEMP/release.jks"`,
   `alias="\${ANDROID_KEY_ALIAS:-upload}"`,
+  `if [ -x "./node_modules/.bin/create-bini-app" ]; then`,
+  `  CREATE_BINI_APP_CMD="./node_modules/.bin/create-bini-app"`,
+  `else`,
+  `  CREATE_BINI_APP_CMD="npx create-bini-app"`,
+  `fi`,
   `if [ -n "$ANDROID_KEY_BASE64" ]; then`,
   `  echo "$ANDROID_KEY_BASE64" | base64 --decode > "$keystore"`,
   `elif [ -n "$ANDROID_PUBLISHER" ] && [ -n "$BINI_SIGN_PASSWORD" ]; then`,
@@ -1429,7 +1425,7 @@ const ANDROID_SIGN_SCRIPT = [
   `  echo "No Android signing secrets found: the release build will be unsigned."`,
   `  exit 0`,
   `fi`,
-  `npx --yes ${CREATE_BINI_APP_PIN} sign android "$keystore" --alias "$alias"`,
+  `$CREATE_BINI_APP_CMD sign android "$keystore" --alias "$alias"`,
 ].join('\n');
 
 function buildAndroidWorkflow(info: PackageManagerInfo): string {
@@ -1570,7 +1566,7 @@ function assertNativeProject(targets: NativePlatform[]): void {
   if (!existsSync(path.join(cwd, 'src-tauri', 'tauri.conf.json'))) {
     throw new Error(
       'No Tauri project found (src-tauri/tauri.conf.json is missing).\n' +
-      `  Add one first: npx ${CREATE_BINI_APP_PIN} add <desktop|android|ios>\n` +
+      '  Add one first: create-bini-app add <desktop|android|ios>\n' +
       '  No Mac? Run `add desktop` (it creates the shared src-tauri/): the iOS project itself is generated in CI.'
     );
   }
@@ -1580,7 +1576,7 @@ function assertNativeProject(targets: NativePlatform[]): void {
   if (missing.length > 0) {
     throw new Error(
       `package.json has no "${missing.map((t) => NATIVE_BUILD_SCRIPTS[t]).join('", "')}" script.\n` +
-      `  Add the native scripts: npx ${CREATE_BINI_APP_PIN} add ${missing.join(' ')}`
+      `  Add the native scripts: create-bini-app add ${missing.join(' ')}`
     );
   }
 }
@@ -1721,12 +1717,25 @@ function runCmd(cmd: string, args: string[], opts: { input?: string } = {}): Pro
   });
 }
 
+function resolveCreateBiniAppCli(): { bin: string; args: string[] } | null {
+  const binName = process.platform === 'win32' ? 'create-bini-app.cmd' : 'create-bini-app';
+  const local = path.join(process.cwd(), 'node_modules', '.bin', binName);
+  if (existsSync(local)) return { bin: local, args: [] };
+  return null;
+}
+
+function createBiniAppCommand(subargs: string[]): { bin: string; args: string[] } {
+  const local = resolveCreateBiniAppCli();
+  if (local) return { bin: local.bin, args: subargs };
+  return { bin: 'npx', args: ['create-bini-app', ...subargs] };
+}
+
 function runSignCli(target: SigningTarget): Promise<boolean> {
-  const args = ['--yes', CREATE_BINI_APP_PIN, 'sign', target, '--ci-only'];
-  log.command(`npx ${args.join(' ')}`);
+  const { bin, args } = createBiniAppCommand(['sign', target, '--ci-only']);
+  log.command(`${bin} ${args.join(' ')}`);
 
   return new Promise((resolve) => {
-    const child = crossSpawn('npx', args, { cwd: process.cwd(), stdio: 'inherit', windowsHide: true });
+    const child = crossSpawn(bin, args, { cwd: process.cwd(), stdio: 'inherit', windowsHide: true });
     child.on('error', () => resolve(false));
     child.on('exit', (code) => resolve(code === 0));
   });
@@ -1744,7 +1753,7 @@ async function ensureSigning(targets: NativePlatform[], skipPrompts: boolean): P
 
     if (!interactive) {
       if (!signed) {
-        log.warn(`${label}: no signing values found, CI will build it unsigned. Set it up with: npx ${CREATE_BINI_APP_PIN} sign ${target} --ci-only`);
+        log.warn(`${label}: no signing values found, CI will build it unsigned. Set it up with: create-bini-app sign ${target} --ci-only`);
       }
       continue;
     }
@@ -1761,7 +1770,7 @@ async function ensureSigning(targets: NativePlatform[], skipPrompts: boolean): P
     }
 
     if (!(await runSignCli(target))) {
-      log.warn(`${label} signing did not finish. CI will build it unsigned until you run: npx ${CREATE_BINI_APP_PIN} sign ${target} --ci-only`);
+      log.warn(`${label} signing did not finish. CI will build it unsigned until you run: create-bini-app sign ${target} --ci-only`);
     }
   }
 }
@@ -2324,7 +2333,7 @@ ${c.heading('Options:')}
 ${c.heading('Native targets:')}
   Generates GitHub Actions workflows (.github/workflows/desktop.yml, android.yml, ios.yml) and removes
   web hosting files. Builds run on GitHub, so this works from any OS.
-  Signing is set up with ${c.yellow(`${CREATE_BINI_APP_PIN} sign <target> --ci-only`)}:
+  Signing is set up with ${c.yellow('create-bini-app sign <target> --ci-only')}:
     Windows, Linux, Android  let the workflow generate a self-signed key (a publisher name, plus a keystore
                              password for Android) or use real credentials. A generated key is created on
                              the first build, saved as a GitHub secret and reused, which needs a repository
@@ -2546,7 +2555,7 @@ function showNextSteps(answers: DeployAnswers): void {
     ];
     if (unsigned.length > 0 && !answers.noSign) {
       steps.push(
-        `Unsigned in CI: ${unsigned.map((t) => SIGNING_LABELS[t]).join(', ')} (macOS then signs ad-hoc). Set up with ${c.yellow(`npx ${CREATE_BINI_APP_PIN} sign <target> --ci-only`)}, then run deploy again`,
+        `Unsigned in CI: ${unsigned.map((t) => SIGNING_LABELS[t]).join(', ')} (macOS then signs ad-hoc). Set up with ${c.yellow('create-bini-app sign <target> --ci-only')}, then run deploy again`,
       );
     }
     printSteps(steps);
