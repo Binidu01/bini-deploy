@@ -187,7 +187,7 @@ const ACTIONS = {
   setupPnpm: 'pnpm/action-setup@v4.1.0',
   setupBun: 'oven-sh/setup-bun@v2.0.1',
   setupJava: 'actions/setup-java@v4.5.0',
-  rustToolchain: 'dtolnay/rust-toolchain@1.83.0',
+  rustToolchain: 'dtolnay/rust-toolchain@stable',
   rustCache: 'swatinem/rust-cache@v2.7.5',
   uploadArtifact: 'actions/upload-artifact@v4.4.3',
 } as const;
