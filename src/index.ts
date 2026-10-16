@@ -1129,9 +1129,9 @@ const versionStep = (): string =>
     fi
     echo "value=$version" >> "$GITHUB_OUTPUT"`;
 
-const releaseStep = (assetGlobs: string[]): string =>
+const releaseStep = (assetGlobs: string[], condition?: string): string =>
   `- name: Publish GitHub release
-  if: github.ref == 'refs/heads/main'
+  if: github.ref == 'refs/heads/main'${condition ? ` && ${condition}` : ''}
   uses: ${ACTIONS.ghRelease}
   with:
     tag_name: v§{{ steps.version.outputs.value }}
@@ -1541,8 +1541,8 @@ jobs:
 function buildIosWorkflow(info: PackageManagerInfo): string {
   const pm = info.pm;
 
-  const signed = scriptCommand(pm, NATIVE_BUILD_SCRIPTS.ios, ['--export-method', 'app-store-connect']);
-  const simulator = scriptCommand(pm, NATIVE_BUILD_SCRIPTS.ios, ['--target', 'aarch64-sim', '--debug']);
+  const signedBuild = scriptCommand(pm, NATIVE_BUILD_SCRIPTS.ios, ['--export-method', 'app-store-connect']);
+  const simulatorBuild = scriptCommand(pm, NATIVE_BUILD_SCRIPTS.ios, ['--target', 'aarch64-sim', '--debug']);
 
   const steps: string[] = [
     ...setupSteps(info),
@@ -1556,36 +1556,70 @@ function buildIosWorkflow(info: PackageManagerInfo): string {
     iconStep(pm),
     versionStep(),
     `- name: Build iOS app
+  id: build
   env:
 ${indent(secretEnv(['IOS_CERTIFICATE', 'IOS_CERTIFICATE_PASSWORD', 'IOS_MOBILE_PROVISION', 'APPLE_DEVELOPMENT_TEAM', 'APPLE_API_ISSUER', 'APPLE_API_KEY', 'APPLE_API_KEY_P8']), 4)}
   run: |
-    if [ -z "$APPLE_DEVELOPMENT_TEAM" ]; then unset APPLE_DEVELOPMENT_TEAM; fi
-    if [ -n "$APPLE_API_KEY_P8" ]; then
+    set -eu
+
+    have_api=false
+    if [ -n "$APPLE_API_KEY_P8" ] && [ -n "$APPLE_API_KEY" ] && [ -n "$APPLE_API_ISSUER" ]; then
       key_path="$RUNNER_TEMP/AuthKey.p8"
       echo "$APPLE_API_KEY_P8" | base64 --decode > "$key_path"
-      echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+      export APPLE_API_KEY_PATH="$key_path"
+      have_api=true
     fi
+
+    have_cert=false
     if [ -n "$IOS_CERTIFICATE" ] && [ -n "$IOS_CERTIFICATE_PASSWORD" ] && [ -n "$IOS_MOBILE_PROVISION" ]; then
-      ${signed}
-    elif [ -n "$APPLE_API_KEY_P8" ] && [ -n "$APPLE_DEVELOPMENT_TEAM" ]; then
+      have_cert=true
+    fi
+
+    if [ "$have_api" = true ] && [ "$have_cert" = true ]; then
+      echo "Building a signed IPA with the provided certificate and provisioning profile."
+      ${signedBuild}
+      echo "signed=true" >> "$GITHUB_OUTPUT"
+    elif [ "$have_api" = true ] && [ -n "$APPLE_DEVELOPMENT_TEAM" ]; then
       echo "Using Xcode automatic signing with the App Store Connect API key."
-      ${signed}
+      ${signedBuild}
+      echo "signed=true" >> "$GITHUB_OUTPUT"
     else
-      echo "No iOS signing secrets found: building for the simulator only."
+      echo "No complete iOS signing setup found: building for the simulator only."
       unset IOS_CERTIFICATE IOS_CERTIFICATE_PASSWORD IOS_MOBILE_PROVISION
+      unset APPLE_DEVELOPMENT_TEAM APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_P8 APPLE_API_KEY_PATH
       tmp="$(mktemp)"
       jq 'del(.bundle.iOS.developmentTeam)' src-tauri/tauri.conf.json > "$tmp"
       mv "$tmp" src-tauri/tauri.conf.json
-      ${simulator}
+      ${simulatorBuild}
+      echo "signed=false" >> "$GITHUB_OUTPUT"
     fi`,
-    `- uses: ${ACTIONS.uploadArtifact}
+    `- name: Package simulator app
+  if: steps.build.outputs.signed == 'false'
+  run: |
+    app="$(find src-tauri/gen/apple/build -maxdepth 4 -type d -name '*.app' | head -n1)"
+    if [ -z "$app" ]; then
+      echo "::error title=No .app found::The simulator build produced no .app bundle."
+      exit 1
+    fi
+    ditto -c -k --keepParent "$app" "$GITHUB_WORKSPACE/ios-simulator.zip"`,
+    `- name: Upload simulator build
+  if: steps.build.outputs.signed == 'false'
+  uses: ${ACTIONS.uploadArtifact}
+  with:
+    name: ios-simulator
+    path: ios-simulator.zip
+    if-no-files-found: error`,
+    `- name: Upload IPA
+  if: steps.build.outputs.signed == 'true'
+  uses: ${ACTIONS.uploadArtifact}
   with:
     name: ios
     path: src-tauri/gen/apple/build/**/*.ipa
-    if-no-files-found: warn`,
-    releaseStep([
-      'src-tauri/gen/apple/build/**/*.ipa',
-    ]),
+    if-no-files-found: error`,
+    releaseStep(
+      ['src-tauri/gen/apple/build/**/*.ipa'],
+      `steps.build.outputs.signed == 'true'`,
+    ),
   ];
 
   const job = `concurrency:
@@ -2403,13 +2437,15 @@ ${c.heading('Native targets:')}
   web hosting files. Builds run on GitHub, so this works from any OS.
   Every push to main builds the app and publishes a GitHub release tagged v<version>, where <version>
   comes from package.json. Installers are attached to the release and also uploaded as run artifacts.
+  Signing secrets are uploaded to GitHub before the push, so the first CI run already sees them.
   Signing is set up with ${c.yellow('create-bini-app sign <target> --ci-only')}:
     Windows, Linux, Android  let the workflow generate a self-signed key (a publisher name, plus a keystore
                              password for Android) or use real credentials. A generated key is created on
                              the first build, saved as a GitHub secret and reused, which needs a repository
                              secret ${c.yellow('SECRETS_PAT')} (deploy offers to add it).
     macOS, iOS               cannot be generated: real Apple credentials, otherwise macOS signs ad-hoc and
-                             iOS builds for the simulator only.
+                             iOS builds for the simulator only (uploaded as the ios-simulator artifact,
+                             no GitHub release).
   Everything in .env.signing is uploaded as GitHub secrets with the GitHub CLI.
   Windows cloud signing (Azure Artifact Signing, Azure Key Vault/relic, SSL.com eSigner, jsign) is detected
   from tauri.cloud-sign.conf.json and the matching CLI is installed by the generated workflow.
@@ -2577,12 +2613,16 @@ async function executeDeployment(answers: DeployAnswers): Promise<void> {
     }
 
     spinner.stop();
-    await pushToGitHub(githubRepo);
 
+    // Upload signing secrets BEFORE pushing: the push to main starts the
+    // workflows immediately, so secrets uploaded afterwards are missed by
+    // the first run and it builds unsigned.
     if (platform === 'native' && !answers.noSign) {
       await uploadSigningSecrets(githubRepo, answers.targets, answers.skipPrompts);
       await ensureSecretsPat(githubRepo, answers.skipPrompts);
     }
+
+    await pushToGitHub(githubRepo);
 
     log.success('All files generated and pushed to GitHub');
 
@@ -2627,7 +2667,7 @@ function showNextSteps(answers: DeployAnswers): void {
     ];
     if (unsigned.length > 0 && !answers.noSign) {
       steps.push(
-        `Unsigned in CI: ${unsigned.map((t) => SIGNING_LABELS[t]).join(', ')} (macOS then signs ad-hoc). Set up with ${c.yellow('create-bini-app sign <target> --ci-only')}, then run deploy again`,
+        `Unsigned in CI: ${unsigned.map((t) => SIGNING_LABELS[t]).join(', ')} (macOS then signs ad-hoc, iOS builds a simulator-only app). Set up with ${c.yellow('create-bini-app sign <target> --ci-only')}, then run deploy again`,
       );
     }
     printSteps(steps);
