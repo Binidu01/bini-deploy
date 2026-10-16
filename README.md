@@ -1,6 +1,6 @@
 # bini-deploy
 
-**Zero-config deployment for [Bini.js](https://bini.js.org) projects: web hosting, or desktop, Android and iOS builds on GitHub Actions, all from one CLI.**
+**Zero-config deployment for [Bini.js](https://bini.js.org) projects: web hosting, or desktop, Android and iOS builds and releases on GitHub Actions, all from one CLI.**
 
 `bini-deploy` generates the right configuration for the target you pick, helps you set up code signing for native builds, and pushes everything to a GitHub repository. A single run deploys either **web** or **native** targets (see [One run, one kind of target](#one-run-one-kind-of-target)).
 
@@ -16,7 +16,7 @@
 ## Features
 
 - **Web hosting, generated for you** - Netlify, Vercel, Cloudflare Workers, Deno Deploy, or Node. Writes the config file and wires up your API routes.
-- **Native builds on GitHub Actions** - generates `desktop.yml`, `android.yml` and `ios.yml` (Tauri). Builds run on GitHub, so you can deploy iOS without owning a Mac.
+- **Native builds and releases on GitHub Actions** - generates `desktop.yml`, `android.yml` and `ios.yml` (Tauri). Every push to `main` builds the app and publishes a GitHub release tagged `v<version>` with the installers attached. Builds run on GitHub, so you can deploy iOS without owning a Mac.
 - **File-based API routing** - files in `src/app/api/` are scanned and mounted as routes (dynamic segments and catch-alls included).
 - **Prerendered pages and real 404s** - on Cloudflare and Deno Deploy, pages prerendered by `bini-ssg` are served directly and unknown routes return your build's `404.html` with a real `404` status. Missing files (`robots.txt`, `favicon.ico`...) return a real `404` on every host.
 - **Automatic CORS** - API routes get `Access-Control-Allow-Origin: *` on every non-Node hosting adapter.
@@ -32,7 +32,7 @@
 - Vite **>= 6**
 - A GitHub repository to push to (created ahead of time), addressed as `https://github.com/<owner>/<repo>` (see [Git behavior](#git-behavior))
 - `git` on your `PATH`
-- A Bini.js project. For native targets, a Tauri project created by [`create-bini-app`](https://www.npmjs.com/package/create-bini-app) (see [Native builds](#native-builds-desktop-android-ios)). When `bini-deploy` runs the signing step it uses the project's local `node_modules/.bin/create-bini-app` if present, otherwise `npx create-bini-app` (not pinned to a version).
+- A Bini.js project. For native targets, a Tauri project created by [`create-bini-app`](https://www.npmjs.com/package/create-bini-app) (see [Native builds](#native-builds-desktop-android-ios)) whose `package.json` has a `version` field. When `bini-deploy` runs the signing step it uses the project's local `node_modules/.bin/create-bini-app` if present, otherwise `npx create-bini-app` (not pinned to a version).
 - Optional: the GitHub CLI (`gh`), logged in, to upload signing secrets automatically
 - For Cloudflare: a recent Wrangler version (array patterns for `run_worker_first`)
 
@@ -201,15 +201,26 @@ This serves `GET /api/hello`.
 
 Native targets are [Tauri](https://tauri.app) apps built by GitHub Actions. `bini-deploy` writes one workflow per target into `.github/workflows/`:
 
-| Target | Workflow | Runner | Output (Artifacts) |
+| Target | Workflow | Runner | Output (Artifacts, and release assets) |
 |--------|----------|--------|--------------------|
-| Desktop | `desktop.yml` | one job each for Windows (`windows-latest`), macOS (`macos-latest`) and Linux (`ubuntu-22.04`) | `src-tauri/target/release/bundle/**`, one artifact per OS (`desktop-Windows`, `desktop-macOS`, `desktop-Linux`) |
+| Desktop | `desktop.yml` | one job each for Windows (`windows-latest`), macOS (`macos-latest`) and Linux (`ubuntu-22.04`) | Artifacts: `src-tauri/target/release/bundle/**`, one per OS (`desktop-Windows`, `desktop-macOS`, `desktop-Linux`). Release: `.msi`, NSIS `.exe`, `.dmg`, `.app.tar.gz`, `.AppImage`, `.deb`, `.rpm` |
 | Android | `android.yml` | `ubuntu-latest` (JDK 17, Android NDK) | `.apk` and `.aab` |
 | iOS | `ios.yml` | `macos-latest` | `.ipa` (a simulator-only build produces none) |
 
-Each workflow can be started manually (**Actions > Run workflow**) or by pushing a tag that starts with `v` (for example `git tag v1.0.0 && git push --tags`). Builds are downloaded from the **Artifacts** section of the run. Workflows are regenerated every time you deploy, so don't edit them by hand. They use Node 22 and the stable Rust toolchain (with a Rust build cache), pin GitHub Actions to exact versions (except `dtolnay/rust-toolchain`, which tracks `stable`), run with read-only repository permissions, cancel an older run of the same workflow on the same ref, and time out after 60 minutes.
+Each workflow runs on **every push to `main`**, and can also be started manually (**Actions > Run workflow**). Pushing a tag no longer triggers a build. Because deploy itself pushes to `main`, the first build starts as soon as the deploy finishes. Builds are available from the **Artifacts** section of the run and from the GitHub release (see [Releases](#releases)). Workflows are regenerated every time you deploy, so don't edit them by hand. They use Node 22 and the stable Rust toolchain (with a Rust build cache), pin GitHub Actions to exact versions (except `dtolnay/rust-toolchain`, which tracks `stable`), request `contents: write` permission (needed to publish releases), cancel an older run of the same workflow on the same ref, and time out after 60 minutes. Since a new push to `main` cancels a run that is still in progress, a quick second push can cancel the first build before its release is published.
 
 The workflows install dependencies with your package manager (`npm ci`, `pnpm install --frozen-lockfile`, `bun install --frozen-lockfile`, or yarn's frozen/immutable install when there is a lockfile), regenerate the app icons from `public/logo.png` with your `tauri:icon` script, and build with the scripts that `create-bini-app` adds to `package.json`: `tauri:build`, `android:build` and `ios:build`. Deploy only checks for the build scripts, so keep `tauri:icon` in `package.json` or the workflows will fail at the icon step.
+
+### Releases
+
+After each successful build, every workflow publishes a GitHub release with [`softprops/action-gh-release`](https://github.com/softprops/action-gh-release):
+
+- The tag and release name are `v<version>`, where `<version>` is the `version` field of `package.json` (so `1.2.0` becomes `v1.2.0`). Release notes are generated automatically.
+- The installers are attached to the release in addition to being uploaded as run artifacts. Desktop attaches the Windows, macOS and Linux bundles from its three jobs to the same release.
+- The release step only runs on `main`. A manual run started from another branch still builds and uploads artifacts, but publishes no release.
+- If `package.json` has no `version`, the workflow stops at its "Read app version" step with an error.
+- The tag comes from the version, not from the commit, so bump `version` in `package.json` when you want a new release. Pushes that keep the same version publish to the same `v<version>` release.
+- An iOS build without signing is a simulator build, so there is no `.ipa` to attach.
 
 ### Before you deploy
 
@@ -219,6 +230,8 @@ Deploy does **not** create the native project. It requires:
 - the build script for each selected target in `package.json` (`tauri:build`, `android:build`, `ios:build`).
 
 If either is missing, deploy stops and tells you to run `create-bini-app add <target>`. Both come from `create-bini-app add`: the first native target creates `src-tauri/` and adds all the native scripts. On Windows and Linux, run `add desktop` to get that shared setup; the iOS project itself is generated in CI.
+
+Deploy does not check for the `version` field in `package.json`; the workflows do, at build time (see [Releases](#releases)).
 
 If `src-tauri/gen/android` or `src-tauri/gen/apple` isn't in your repository, the workflow generates it on the runner (`tauri android init --ci` / `tauri ios init --ci`), using the identifier and app name from your `tauri.conf.json`.
 
@@ -232,8 +245,8 @@ If `src-tauri/gen/android` or `src-tauri/gen/apple` isn't in your repository, th
    ```
 
    using the project's local `node_modules/.bin/create-bini-app` if it exists, otherwise `npx create-bini-app` (not pinned to a version, so `npx` fetches the latest release unless you have it installed). Desktop covers three targets (`windows`, `macos`, `linux`), Android and iOS one each. The values are saved to `.env.signing`. If signing does not finish, deploy warns and carries on. Skipped targets still build in CI, just unsigned (ad-hoc signed on macOS, simulator-only on iOS).
-3. **Workflows are generated** and everything is committed and pushed.
-4. **Secrets are uploaded** to the repository with the GitHub CLI (see below).
+3. **Workflows are generated** and everything is committed and pushed. The push to `main` triggers the new workflows right away.
+4. **Secrets are uploaded** to the repository with the GitHub CLI (see below). This happens after the push, so the first run can start before the secrets exist and build unsigned. If that matters, upload the secrets first or re-run the workflow afterwards.
 5. **`SECRETS_PAT` is checked** when any generated key is in use (see below).
 
 `--nosign` skips steps 2, 4 and 5.
@@ -264,7 +277,7 @@ For each platform the workflow uses, in order: real or saved credentials from se
 - **macOS** - signs with your Developer ID certificate when `APPLE_CERTIFICATE` and its password exist, and notarizes when an App Store Connect API key or Apple ID credentials were saved. Otherwise it uses an ad-hoc signature.
 - **Linux** - imports your GPG key (or generates one for `LINUX_PUBLISHER`, without a passphrase) and signs both the AppImage and the RPM. A signing failure fails the build instead of producing an unsigned AppImage. With no key, both are unsigned.
 - **Android** - uses your keystore (`ANDROID_KEY_BASE64`), or creates one for `ANDROID_PUBLISHER` with `ANDROID_KEYSTORE_PASSWORD`, then wires Gradle with `create-bini-app sign android`. With neither, the release build is unsigned.
-- **iOS** - with certificate, password and provisioning profile it builds an `app-store-connect` export. With an App Store Connect API key and a team ID it uses Xcode automatic signing. Without either it builds for the simulator only.
+- **iOS** - with certificate, password and provisioning profile it builds an `app-store-connect` export. With an App Store Connect API key and a team ID it uses Xcode automatic signing. Without either it builds for the simulator only, and removes `bundle.iOS.developmentTeam` from `tauri.conf.json` in the runner's checkout (the file in your repository is not changed).
 
 ## What cleanup deletes
 
@@ -302,6 +315,10 @@ Your token is missing the `workflow` scope. Create a new Personal Access Token w
 
 The GitHub CLI is missing or not logged in. Install it, run `gh auth login`, then run deploy again. You can also add the secrets by hand at `https://github.com/<you>/<repo>/settings/secrets/actions`.
 
+### Native: the first build is unsigned even though I saved credentials
+
+Deploy pushes the workflows before it uploads the secrets, and the push already triggers a build. Re-run the workflow from the **Actions** tab once the secrets are uploaded.
+
 ### Native: a new signing key is created on every build
 
 The workflow can't save the generated key because `SECRETS_PAT` is missing or its token lacks **Secrets: Read and write** for this repository. Add it at `https://github.com/<you>/<repo>/settings/secrets/actions`, or run deploy again and accept the prompt.
@@ -313,6 +330,14 @@ No signing values were saved for it. Run `npx create-bini-app@latest sign <targe
 ### Native: the workflow fails at "Generate app icons"
 
 The workflows run your `tauri:icon` script (which needs `public/logo.png`). Restore the script, or run `create-bini-app add` again to bring the native scripts back.
+
+### Native: the workflow fails at "Read app version"
+
+`package.json` has no `version` field. Add one (for example `"version": "0.1.0"`) and push again. The release tag is `v<version>`.
+
+### Native: no release appeared
+
+Releases are only published from runs on `main`, after the build and artifact upload succeed. Check the run's "Publish GitHub release" step. A newer push to `main` cancels a run that is still in progress, and an unsigned iOS build is a simulator build with no `.ipa` to attach.
 
 ### Cloudflare: the first deploy fails, the second works
 
@@ -332,7 +357,7 @@ The generated `server/index.ts` is from an older version. Run `bini-deploy --gen
 
 ## Contributing
 
-Issues and pull requests are welcome. To add a hosting provider, extend the `Platform` type, `ADAPTERS`, `HOSTING_CONFIGS`, `WEB_NEXT_STEPS` and the `platformDirs` map in `cleanupPlatformArtifacts`, and add a case to `generateHostingConfig` in `src/index.ts`. For native targets, the workflow builders (`buildDesktopWorkflow`, `buildAndroidWorkflow`, `buildIosWorkflow`) and the signing lists (`SIGNING_SECRETS`, `SIGNING_MARKERS`, `SIGNING_GITIGNORE`) are the places to change.
+Issues and pull requests are welcome. To add a hosting provider, extend the `Platform` type, `ADAPTERS`, `HOSTING_CONFIGS`, `WEB_NEXT_STEPS` and the `platformDirs` map in `cleanupPlatformArtifacts`, and add a case to `generateHostingConfig` in `src/index.ts`. For native targets, the workflow builders (`buildDesktopWorkflow`, `buildAndroidWorkflow`, `buildIosWorkflow`), the shared `versionStep` and `releaseStep`, and the signing lists (`SIGNING_SECRETS`, `SIGNING_MARKERS`, `SIGNING_GITIGNORE`) are the places to change.
 
 ```bash
 git clone https://github.com/Binidu01/bini-deploy

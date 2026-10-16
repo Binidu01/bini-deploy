@@ -190,6 +190,7 @@ const ACTIONS = {
   rustToolchain: 'dtolnay/rust-toolchain@stable',
   rustCache: 'swatinem/rust-cache@v2.7.5',
   uploadArtifact: 'actions/upload-artifact@v4.4.3',
+  ghRelease: 'softprops/action-gh-release@v2.0.9',
 } as const;
 
 type Platform = 'node' | 'netlify' | 'vercel' | 'cloudflare' | 'deno';
@@ -1115,6 +1116,30 @@ const installStep = (info: PackageManagerInfo): string =>
 const iconStep = (pm: PackageManager): string =>
   `- name: Generate app icons\n  run: ${scriptCommand(pm, 'tauri:icon')}`;
 
+const versionStep = (): string =>
+  `- name: Read app version
+  id: version
+  shell: bash
+  run: |
+    set -eu
+    version="$(jq -r '.version // empty' package.json)"
+    if [ -z "$version" ]; then
+      echo "::error title=Version not found::package.json has no version field."
+      exit 1
+    fi
+    echo "value=$version" >> "$GITHUB_OUTPUT"`;
+
+const releaseStep = (assetGlobs: string[]): string =>
+  `- name: Publish GitHub release
+  if: github.ref == 'refs/heads/main'
+  uses: ${ACTIONS.ghRelease}
+  with:
+    tag_name: v§{{ steps.version.outputs.value }}
+    name: v§{{ steps.version.outputs.value }}
+    generate_release_notes: true
+    files: |
+${assetGlobs.map((g) => `      ${g}`).join('\n')}`;
+
 function rustSteps(targets?: string[]): string[] {
   const toolchain = targets?.length
     ? `- name: Install Rust\n  uses: ${ACTIONS.rustToolchain}\n  with:\n    targets: ${targets.join(',')}`
@@ -1123,13 +1148,13 @@ function rustSteps(targets?: string[]): string[] {
 }
 
 const WORKFLOW_TRIGGERS = `on:
-  workflow_dispatch:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
+  workflow_dispatch:
 
 permissions:
-  contents: read`;
+  contents: write`;
 
 function renderWorkflow(head: string, jobLines: string, steps: string[], pm: PackageManager): string {
   return (
@@ -1374,6 +1399,7 @@ ${indent(secretEnv(['GPG_PRIVATE_KEY', 'SIGN_KEY', 'APPIMAGETOOL_SIGN_PASSPHRASE
     GH_TOKEN: §{{ secrets.SECRETS_PAT }}
   run: |
 ${indent(LINUX_SIGN_SCRIPT, 4)}`,
+    versionStep(),
     `- name: Build desktop app
   env:
     TAURI: 'true'
@@ -1384,6 +1410,15 @@ ${indent(LINUX_SIGN_SCRIPT, 4)}`,
     name: desktop-§{{ matrix.label }}
     path: src-tauri/target/release/bundle/**
     if-no-files-found: error`,
+    releaseStep([
+      'src-tauri/target/release/bundle/msi/*.msi',
+      'src-tauri/target/release/bundle/nsis/*.exe',
+      'src-tauri/target/release/bundle/dmg/*.dmg',
+      'src-tauri/target/release/bundle/macos/*.app.tar.gz',
+      'src-tauri/target/release/bundle/appimage/*.AppImage',
+      'src-tauri/target/release/bundle/deb/*.deb',
+      'src-tauri/target/release/bundle/rpm/*.rpm',
+    ]),
   ];
 
   const job = `concurrency:
@@ -1470,6 +1505,7 @@ ${indent(secretEnv(['ANDROID_KEY_BASE64', 'ANDROID_KEY_ALIAS', 'ANDROID_PUBLISHE
     GH_TOKEN: §{{ secrets.SECRETS_PAT }}
   run: |
 ${indent(ANDROID_SIGN_SCRIPT, 4)}`,
+    versionStep(),
     `- name: Build Android app
   run: |
     ${scriptCommand(pm, NATIVE_BUILD_SCRIPTS.android)}`,
@@ -1480,6 +1516,10 @@ ${indent(ANDROID_SIGN_SCRIPT, 4)}`,
       src-tauri/gen/android/app/build/outputs/**/*.apk
       src-tauri/gen/android/app/build/outputs/**/*.aab
     if-no-files-found: error`,
+    releaseStep([
+      'src-tauri/gen/android/app/build/outputs/apk/**/*.apk',
+      'src-tauri/gen/android/app/build/outputs/bundle/**/*.aab',
+    ]),
   ];
 
   const job = `concurrency:
@@ -1514,6 +1554,7 @@ function buildIosWorkflow(info: PackageManagerInfo): string {
       ${scriptCommand(pm, 'tauri', ['ios', 'init', '--ci'])}
     fi`,
     iconStep(pm),
+    versionStep(),
     `- name: Build iOS app
   env:
 ${indent(secretEnv(['IOS_CERTIFICATE', 'IOS_CERTIFICATE_PASSWORD', 'IOS_MOBILE_PROVISION', 'APPLE_DEVELOPMENT_TEAM', 'APPLE_API_ISSUER', 'APPLE_API_KEY', 'APPLE_API_KEY_P8']), 4)}
@@ -1532,6 +1573,9 @@ ${indent(secretEnv(['IOS_CERTIFICATE', 'IOS_CERTIFICATE_PASSWORD', 'IOS_MOBILE_P
     else
       echo "No iOS signing secrets found: building for the simulator only."
       unset IOS_CERTIFICATE IOS_CERTIFICATE_PASSWORD IOS_MOBILE_PROVISION
+      tmp="$(mktemp)"
+      jq 'del(.bundle.iOS.developmentTeam)' src-tauri/tauri.conf.json > "$tmp"
+      mv "$tmp" src-tauri/tauri.conf.json
       ${simulator}
     fi`,
     `- uses: ${ACTIONS.uploadArtifact}
@@ -1539,6 +1583,9 @@ ${indent(secretEnv(['IOS_CERTIFICATE', 'IOS_CERTIFICATE_PASSWORD', 'IOS_MOBILE_P
     name: ios
     path: src-tauri/gen/apple/build/**/*.ipa
     if-no-files-found: warn`,
+    releaseStep([
+      'src-tauri/gen/apple/build/**/*.ipa',
+    ]),
   ];
 
   const job = `concurrency:
@@ -2354,6 +2401,8 @@ ${c.heading('Options:')}
 ${c.heading('Native targets:')}
   Generates GitHub Actions workflows (.github/workflows/desktop.yml, android.yml, ios.yml) and removes
   web hosting files. Builds run on GitHub, so this works from any OS.
+  Every push to main builds the app and publishes a GitHub release tagged v<version>, where <version>
+  comes from package.json. Installers are attached to the release and also uploaded as run artifacts.
   Signing is set up with ${c.yellow('create-bini-app sign <target> --ci-only')}:
     Windows, Linux, Android  let the workflow generate a self-signed key (a publisher name, plus a keystore
                              password for Android) or use real credentials. A generated key is created on
@@ -2571,9 +2620,10 @@ function showNextSteps(answers: DeployAnswers): void {
     const unsigned = signingTargetsFor(answers.targets).filter((t) => !isSigned(t, env));
 
     const steps = [
-      `Open ${c.cyan(`${githubRepo}/actions`)}`,
-      `Run a workflow (${c.yellow(files.join(', '))}) with "Run workflow", or push a tag: ${c.yellow('git tag v1.0.0 && git push --tags')}`,
-      `Download the builds from the ${c.cyan('Artifacts')} section of the run`,
+      `Push to main (or run a workflow manually) to build and publish a release`,
+      `Workflows: ${c.yellow(files.join(', '))}`,
+      `Releases are tagged ${c.yellow('v<version>')} where ${c.yellow('version')} comes from package.json`,
+      `Download installers from the ${c.cyan('Releases')} page, or from the run's ${c.cyan('Artifacts')} section`,
     ];
     if (unsigned.length > 0 && !answers.noSign) {
       steps.push(
