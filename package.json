@@ -1,6 +1,6 @@
 {
   "name": "bini-deploy",
-  "version": "2.0.6",
+  "version": "2.1.0",
   "description": "Deploy Bini.js projects to any platform",
   "type": "module",
   "main": "dist/index.js",
@@ -17,19 +17,20 @@
     "bini-deploy": "./dist/index.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "templates"
   ],
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
     "deploy": "node dist/index.js",
-    "prepublishOnly": "npm run build"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm run build"
   },
   "dependencies": {
     "@clack/prompts": "^1.7.0",
-    "chalk": "^6.0.0",
     "cross-spawn": "^7.0.6",
-    "ora": "^9.4.1"
+    "simple-git": "^3.27.0"
   },
   "peerDependencies": {
     "vite": ">=6.0.0"
@@ -46,6 +47,7 @@
   },
   "keywords": [
     "bini",
+    "bini.js",
     "deploy",
     "vercel",
     "netlify",

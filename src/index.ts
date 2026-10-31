@@ -1,14 +1,27 @@
-import { existsSync, readdirSync, mkdirSync, readFileSync, statSync, writeFileSync, unlinkSync, rmSync, realpathSync } from 'fs';
-import { writeFile } from 'fs/promises';
-import { createRequire } from 'module';
-import crossSpawn from 'cross-spawn';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import { isatty } from 'tty';
-import { styleText } from 'node:util';
+import {
+  existsSync,
+  readdirSync,
+  mkdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+  unlinkSync,
+  rmSync,
+  realpathSync,
+  copyFileSync,
+} from 'node:fs';
+import { writeFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { isatty } from 'node:tty';
+import { styleText, parseArgs as nodeParseArgs } from 'node:util';
 import * as clack from '@clack/prompts';
+import simpleGit, { type SimpleGit } from 'simple-git';
+import crossSpawn, { sync as spawnSync } from 'cross-spawn';
 
 const require = createRequire(import.meta.url);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 type Format = Parameters<typeof styleText>[0];
 
@@ -87,9 +100,6 @@ const input = (o: { message: string; default?: string; validate?: (v: string) =>
     }),
   );
 
-const password = (o: { message: string; validate?: (v: string) => true | string }): Promise<string> =>
-  ask<string>(clack.password({ message: o.message, mask: '*', validate: toValidate(o.validate) }));
-
 const confirm = (o: { message: string; default?: boolean }): Promise<boolean> =>
   ask<boolean>(clack.confirm({ message: o.message, initialValue: o.default !== false }));
 
@@ -119,58 +129,6 @@ const checkbox = async <T extends string>(o: {
   }
 };
 
-function createSpinner(initial: string) {
-  const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-  const tty = Boolean(process.stdout.isTTY);
-  let timer: NodeJS.Timeout | undefined;
-  let text = initial;
-  let frame = 0;
-
-  const render = (): void => {
-    process.stdout.write(`\r\x1b[2K${paint('cyan', frames[frame++ % frames.length] as string)} ${text}`);
-  };
-  const clear = (): void => {
-    if (tty) process.stdout.write('\r\x1b[2K');
-  };
-
-  const spinner = {
-    get isSpinning(): boolean {
-      return timer !== undefined;
-    },
-    get text(): string {
-      return text;
-    },
-    set text(value: string) {
-      text = value;
-    },
-    start(message?: string) {
-      if (message) text = message;
-      if (timer === undefined && tty) {
-        render();
-        timer = setInterval(render, 80);
-        timer.unref();
-      } else if (timer === undefined) {
-        log.step(text);
-        timer = setInterval(() => {}, 1 << 30);
-        timer.unref();
-      }
-      return spinner;
-    },
-    stop() {
-      if (timer !== undefined) {
-        clearInterval(timer);
-        timer = undefined;
-        clear();
-      }
-    },
-    fail(message: string) {
-      spinner.stop();
-      log.error(message);
-    },
-  };
-  return spinner;
-}
-
 const GITHUB_URL_REGEX = /^https:\/\/github\.com\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+$/;
 const ALLOWED_ROUTE_PATTERN = /^[a-zA-Z0-9_-]+$/;
 const ALLOWED_PARAM_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
@@ -180,27 +138,85 @@ const MAX_FILE_SIZE = 10 * 1024 * 1024;
 const API_EXTS = ['.ts', '.js'] as const;
 
 const DEFAULT_BRANCH = 'main';
-
-const ACTIONS = {
-  checkout: 'actions/checkout@v4.2.2',
-  setupNode: 'actions/setup-node@v4.1.0',
-  setupPnpm: 'pnpm/action-setup@v4.1.0',
-  setupBun: 'oven-sh/setup-bun@v2.0.1',
-  setupJava: 'actions/setup-java@v4.5.0',
-  rustToolchain: 'dtolnay/rust-toolchain@stable',
-  rustCache: 'swatinem/rust-cache@v2.7.5',
-  uploadArtifact: 'actions/upload-artifact@v4.4.3',
-  ghRelease: 'softprops/action-gh-release@v2.0.9',
-} as const;
+const DEFAULT_COMMIT_MESSAGE = 'chore: add deployment configuration';
 
 type Platform = 'node' | 'netlify' | 'vercel' | 'cloudflare' | 'deno';
 type NonNodePlatform = Exclude<Platform, 'node'>;
-
-type NativePlatform = 'desktop' | 'android' | 'ios';
-
+type NativeTarget = 'desktop' | 'android' | 'ios';
 type SigningTarget = 'windows' | 'macos' | 'linux' | 'android' | 'ios';
-
 type PackageManager = 'npm' | 'pnpm' | 'yarn' | 'bun';
+
+const WORKFLOW_FILES: Record<NativeTarget, string> = {
+  desktop: 'desktop.yml',
+  android: 'android.yml',
+  ios: 'ios.yml',
+};
+
+const NATIVE_LABELS: Record<NativeTarget, string> = {
+  desktop: 'Desktop (Windows, macOS, Linux)',
+  android: 'Android',
+  ios: 'iOS',
+};
+
+const SIGNING_LABELS: Record<SigningTarget, string> = {
+  windows: 'Windows',
+  macos: 'macOS',
+  linux: 'Linux',
+  android: 'Android',
+  ios: 'iOS',
+};
+
+const SIGNING_PLATFORM: Record<SigningTarget, NativeTarget> = {
+  windows: 'desktop',
+  macos: 'desktop',
+  linux: 'desktop',
+  android: 'android',
+  ios: 'ios',
+};
+
+const SIGNING_ENV_FILE = '.env.signing';
+
+const SECRET_GROUPS: Record<SigningTarget, string[]> = {
+  windows: ['WINDOWS_CERTIFICATE', 'WINDOWS_CERTIFICATE_PASSWORD', 'WINDOWS_PUBLISHER'],
+  macos: [
+    'APPLE_CERTIFICATE',
+    'APPLE_CERTIFICATE_PASSWORD',
+    'APPLE_SIGNING_IDENTITY',
+    'KEYCHAIN_PASSWORD',
+    'APPLE_API_ISSUER',
+    'APPLE_API_KEY',
+    'APPLE_API_KEY_P8',
+    'APPLE_ID',
+    'APPLE_PASSWORD',
+    'APPLE_TEAM_ID',
+  ],
+  linux: [
+    'GPG_PRIVATE_KEY',
+    'SIGN',
+    'SIGN_KEY',
+    'APPIMAGETOOL_FORCE_SIGN',
+    'TAURI_SIGNING_RPM_KEY',
+    'APPIMAGETOOL_SIGN_PASSPHRASE',
+    'TAURI_SIGNING_RPM_KEY_PASSPHRASE',
+    'LINUX_PUBLISHER',
+  ],
+  android: [
+    'ANDROID_KEY_BASE64',
+    'ANDROID_KEY_ALIAS',
+    'ANDROID_KEY_PASSWORD',
+    'ANDROID_KEYSTORE_PASSWORD',
+    'ANDROID_PUBLISHER',
+  ],
+  ios: [
+    'IOS_CERTIFICATE',
+    'IOS_CERTIFICATE_PASSWORD',
+    'IOS_MOBILE_PROVISION',
+    'APPLE_DEVELOPMENT_TEAM',
+    'APPLE_API_ISSUER',
+    'APPLE_API_KEY',
+    'APPLE_API_KEY_P8',
+  ],
+};
 
 interface ApiRoute {
   routePath: string;
@@ -219,12 +235,12 @@ interface AdapterConfig {
 
 interface DeployAnswers {
   platform: 'web' | 'native';
-  targets: NativePlatform[];
+  targets: NativeTarget[];
   webHosting?: Platform;
   githubRepo: string;
   projectName: string;
   skipPrompts: boolean;
-  noSign: boolean;
+  commitMessage?: string;
 }
 
 const ADAPTERS: Record<NonNodePlatform, AdapterConfig> = {
@@ -287,7 +303,7 @@ const WEB_NEXT_STEPS: Record<Platform, (pm: PackageManager) => string[]> = {
   cloudflare: (pm) => [
     `Install Wrangler: ${c.yellow(pm === 'npm' ? 'npm install -g wrangler' : `${pm} add -g wrangler`)}`,
     `Run: ${c.yellow(scriptCommand(pm, 'build'))} then ${c.yellow('wrangler deploy')}`,
-    `If you use Workers Builds, the Worker name in the dashboard must match ${c.yellow('name')} in ${c.yellow('wrangler.toml')}`,
+    `Worker name in the dashboard must match ${c.yellow('name')} in ${c.yellow('wrangler.toml')}`,
     `Your worker handles ${c.cyan('/api/*')} routes`,
   ],
   deno: (pm) => [
@@ -326,6 +342,11 @@ function toWorkerName(name: string): string {
     .slice(0, 63)
     .replace(/-+$/g, '');
   return cleaned || 'my-app';
+}
+
+function toTitleCase(slug: string): string {
+  const words = slug.split(/[-_.\s]+/).filter(Boolean);
+  return words.length === 0 ? 'My App' : words.map((w) => w[0].toUpperCase() + w.slice(1)).join(' ');
 }
 
 function isTypeScriptProject(): boolean {
@@ -472,11 +493,7 @@ function scanApiRoutes(dir: string, baseRoute = '', basePath: string = '', depth
   return routes;
 }
 
-function resolveEntryImportPath(
-  filePath: string,
-  outFile: string,
-  usesDenoRuntime: boolean,
-): string {
+function resolveEntryImportPath(filePath: string, outFile: string, usesDenoRuntime: boolean): string {
   const rel = norm(path.relative(path.dirname(outFile), filePath));
   if (usesDenoRuntime) {
     const withTs = rel.replace(/\.tsx$/, '.ts');
@@ -619,7 +636,6 @@ function getDenoSpaFallback(): string[] {
     `  }`,
     `  if (pathname.includes('..') || pathname.includes('\\\\')) return notFound();`,
     ``,
-    `  // Paths with a file extension: serve the file as-is, otherwise a real 404`,
     `  if (/\\.[a-zA-Z0-9]+$/.test(pathname)) {`,
     `    const file = await tryRead(pathname);`,
     `    if (!file) return notFound();`,
@@ -629,12 +645,10 @@ function getDenoSpaFallback(): string[] {
     `    });`,
     `  }`,
     ``,
-    `  // Extensionless paths: the prerendered page dist/<route>/index.html`,
     `  const clean = pathname.replace(/\\/+$/, '');`,
     `  const page = await tryRead(clean + '/index.html');`,
     `  if (page) return htmlResponse(page);`,
     ``,
-    `  // Dynamic routes (/blog/123): nearest parent shell written by bini-ssg`,
     `  const parts = clean.split('/').filter(Boolean);`,
     `  while (parts.length > 1) {`,
     `    parts.pop();`,
@@ -673,12 +687,7 @@ function buildEntryContent(
   const isNetlify = platform === 'netlify';
   const isCloudflare = platform === 'cloudflare';
 
-  const { imports, mountings, corsLine, corsImport } = buildRouteImports(
-    routes,
-    outFile,
-    enableCors,
-    platform,
-  );
+  const { imports, mountings, corsLine, corsImport } = buildRouteImports(routes, outFile, enableCors, platform);
 
   const lines: string[] = [
     `// Auto-generated by bini-deploy - do not edit.`,
@@ -747,8 +756,7 @@ function checkAdapter(platform: NonNodePlatform): void {
     require.resolve(adapter.pkg, { paths: [process.cwd()] });
   } catch {
     throw new Error(
-      `Missing required package for platform '${platform}'.\n` +
-      `  Run: npm install ${adapter.pkg}`
+      `Missing required package for platform '${platform}'.\n` + `  Run: npm install ${adapter.pkg}`,
     );
   }
 }
@@ -813,7 +821,7 @@ export async function generateProductionEntry(
   platform: NonNodePlatform,
   apiDir?: string,
   enableCors: boolean = true,
-  basePath: string = ''
+  basePath: string = '',
 ): Promise<void> {
   const cwd = process.cwd();
   const srcApiDir = apiDir || path.join(cwd, 'src/app/api');
@@ -861,12 +869,9 @@ export async function generateProductionEntry(
   }
 }
 
-async function generateHostingConfig(
-  hosting: NonNodePlatform,
-  projectName: string,
-): Promise<string | null> {
+async function generateHostingConfig(hosting: NonNodePlatform, projectName: string): Promise<string | null> {
   const cwd = process.cwd();
-  const pm = detectPackageManager().pm;
+  const pm = detectPackageManager();
 
   cleanupPlatformArtifacts(hosting, isTypeScriptProject());
 
@@ -936,10 +941,7 @@ export default async (request, context) => {
 export const config = { path: '/*', excludedPath: ['/api/*'] };
 `;
 
-      await writeFile(
-        path.join(edgeDir, ts ? 'spa-fallback.ts' : 'spa-fallback.js'),
-        fallbackBody,
-      );
+      await writeFile(path.join(edgeDir, ts ? 'spa-fallback.ts' : 'spa-fallback.js'), fallbackBody);
       return outFile;
     }
 
@@ -996,46 +998,12 @@ run_worker_first = ["/api/*"]
   }
 }
 
-const WORKFLOWS_DIR = path.join('.github', 'workflows');
-const NODE_VERSION = '22';
-const LINUX_RUNNER = 'ubuntu-22.04';
-
-const workflowHeader = (pm: PackageManager): string =>
-  [
-    '# Auto-generated by bini-deploy - do not edit.',
-    `# Regenerated every time you run \`${scriptCommand(pm, 'deploy')}\`.`,
-  ].join('\n');
-
-const WORKFLOW_FILES: Record<NativePlatform, string> = {
-  desktop: 'desktop.yml',
-  android: 'android.yml',
-  ios: 'ios.yml',
-};
-
-const NATIVE_BUILD_SCRIPTS: Record<NativePlatform, string> = {
-  desktop: 'tauri:build',
-  android: 'android:build',
-  ios: 'ios:build',
-};
-
-const NATIVE_LABELS: Record<NativePlatform, string> = {
-  desktop: 'Desktop (Windows, macOS, Linux)',
-  android: 'Android',
-  ios: 'iOS',
-};
-
-interface PackageManagerInfo {
-  pm: PackageManager;
-  hasLock: boolean;
-  pnpmNeedsVersion: boolean;
-  yarnBerry: boolean;
-}
-
+// Order mirrors bini-cli's LOCKFILE_NAMES (bun first).
 const LOCK_FILES: Array<[file: string, pm: PackageManager]> = [
-  ['bun.lock', 'bun'],
   ['bun.lockb', 'bun'],
-  ['yarn.lock', 'yarn'],
+  ['bun.lock', 'bun'],
   ['pnpm-lock.yaml', 'pnpm'],
+  ['yarn.lock', 'yarn'],
   ['package-lock.json', 'npm'],
 ];
 
@@ -1047,23 +1015,12 @@ function readPackageJson(): Record<string, any> | null {
   }
 }
 
-function detectPackageManager(): PackageManagerInfo {
+function detectPackageManager(): PackageManager {
   const cwd = process.cwd();
-  const pkg = readPackageJson();
-  const hit = LOCK_FILES.find(([file]) => existsSync(path.join(cwd, file)));
-
-  let pm: PackageManager = 'npm';
-  let hasLock = false;
-  if (hit) {
-    pm = hit[1];
-    hasLock = true;
-  } else {
-    const ua = process.env.npm_config_user_agent?.split(' ')[0]?.split('/')[0];
-    if (ua === 'bun' || ua === 'yarn' || ua === 'pnpm' || ua === 'npm') pm = ua;
+  for (const [file, pm] of LOCK_FILES) {
+    if (existsSync(path.join(cwd, file))) return pm;
   }
-
-  const yarnBerry = pm === 'yarn' && existsSync(path.join(cwd, '.yarnrc.yml'));
-  return { pm, hasLock, pnpmNeedsVersion: pm === 'pnpm' && !pkg?.packageManager, yarnBerry };
+  return 'npm';
 }
 
 function scriptCommand(pm: PackageManager, script: string, args: string[] = []): string {
@@ -1071,674 +1028,32 @@ function scriptCommand(pm: PackageManager, script: string, args: string[] = []):
   return `${pm} run ${script}${args.length ? ` ${args.join(' ')}` : ''}`;
 }
 
-function installCommand(info: PackageManagerInfo): string {
-  switch (info.pm) {
-    case 'npm':
-      return info.hasLock ? 'npm ci' : 'npm install';
-    case 'pnpm':
-      return info.hasLock ? 'pnpm install --frozen-lockfile' : 'pnpm install';
-    case 'bun':
-      return info.hasLock ? 'bun install --frozen-lockfile' : 'bun install';
-    case 'yarn':
-      if (!info.hasLock) return 'yarn install';
-      return info.yarnBerry ? 'yarn install --immutable' : 'yarn install --frozen-lockfile';
-  }
-}
+/* ────────────────────── Signing secrets + workflow writer ────────────────────── */
 
-const indent = (text: string, spaces: number): string =>
-  text
-    .split('\n')
-    .map((line) => (line.length > 0 ? ' '.repeat(spaces) + line : line))
-    .join('\n');
-
-const ghx = (text: string): string => text.replace(/§\{\{/g, () => '$' + '{{');
-
-const secretEnv = (names: string[]): string => names.map((n) => `${n}: §{{ secrets.${n} }}`).join('\n');
-
-function setupSteps(info: PackageManagerInfo): string[] {
-  const steps: string[] = [`- uses: ${ACTIONS.checkout}`];
-  if (info.pm === 'pnpm') {
-    steps.push(
-      info.pnpmNeedsVersion
-        ? `- uses: ${ACTIONS.setupPnpm}\n  with:\n    version: 10`
-        : `- uses: ${ACTIONS.setupPnpm}`,
-    );
-  }
-  if (info.pm === 'bun') steps.push(`- uses: ${ACTIONS.setupBun}`);
-  const cache = info.hasLock && info.pm !== 'bun' ? `\n    cache: ${info.pm}` : '';
-  steps.push(`- uses: ${ACTIONS.setupNode}\n  with:\n    node-version: '${NODE_VERSION}'${cache}`);
-  return steps;
-}
-
-const installStep = (info: PackageManagerInfo): string =>
-  `- name: Install dependencies\n  run: ${installCommand(info)}`;
-
-const iconStep = (pm: PackageManager): string =>
-  `- name: Generate app icons\n  run: ${scriptCommand(pm, 'tauri:icon')}`;
-
-const versionStep = (): string =>
-  `- name: Read app version
-  id: version
-  shell: bash
-  run: |
-    set -eu
-    version="$(jq -r '.version // empty' package.json)"
-    if [ -z "$version" ]; then
-      echo "::error title=Version not found::package.json has no version field."
-      exit 1
-    fi
-    echo "value=$version" >> "$GITHUB_OUTPUT"`;
-
-const releaseStep = (assetGlobs: string[], condition?: string): string =>
-  `- name: Publish GitHub release
-  if: github.ref == 'refs/heads/main'${condition ? ` && ${condition}` : ''}
-  uses: ${ACTIONS.ghRelease}
-  with:
-    tag_name: v§{{ steps.version.outputs.value }}
-    name: v§{{ steps.version.outputs.value }}
-    generate_release_notes: true
-    files: |
-${assetGlobs.map((g) => `      ${g}`).join('\n')}`;
-
-function rustSteps(targets?: string[]): string[] {
-  const toolchain = targets?.length
-    ? `- name: Install Rust\n  uses: ${ACTIONS.rustToolchain}\n  with:\n    targets: ${targets.join(',')}`
-    : `- name: Install Rust\n  uses: ${ACTIONS.rustToolchain}`;
-  return [toolchain, `- uses: ${ACTIONS.rustCache}\n  with:\n    workspaces: src-tauri`];
-}
-
-const WORKFLOW_TRIGGERS = `on:
-  push:
-    branches:
-      - main
-  workflow_dispatch:
-
-permissions:
-  contents: write`;
-
-function renderWorkflow(head: string, jobLines: string, steps: string[], pm: PackageManager): string {
-  return (
-    ghx(
-      [workflowHeader(pm), head, '', WORKFLOW_TRIGGERS, '', jobLines, '    steps:', steps.map((s) => indent(s, 6)).join('\n\n')].join('\n'),
-    ) + '\n'
-  );
-}
-
-type CloudSignTool = 'artifact-signing' | 'relic' | 'sslcom' | 'jsign' | 'unknown' | null;
-
-function detectCloudSignTool(projectPath: string): CloudSignTool {
-  const confPath = path.join(projectPath, 'src-tauri', 'tauri.cloud-sign.conf.json');
-  if (!existsSync(confPath)) return null;
-  try {
-    const conf = JSON.parse(readFileSync(confPath, 'utf8')) as {
-      bundle?: { windows?: { signCommand?: string } };
-    };
-    const cmd = conf.bundle?.windows?.signCommand ?? '';
-    if (/artifact-signing-cli/i.test(cmd)) return 'artifact-signing';
-    if (/relic/i.test(cmd)) return 'relic';
-    if (/CodeSignTool|eSigner|ssl\.com/i.test(cmd)) return 'sslcom';
-    if (/jsign/i.test(cmd)) return 'jsign';
-    return 'unknown';
-  } catch {
-    return 'unknown';
-  }
-}
-
-function cloudSignInstallSteps(tool: CloudSignTool): string[] {
-  switch (tool) {
-    case 'artifact-signing':
-      return [
-        `- name: Install Azure Artifact Signing CLI
-  if: runner.os == 'Windows'
-  shell: pwsh
-  run: |
-    dotnet tool install --global artifact-signing-cli
-    echo "$env:USERPROFILE\\.dotnet\\tools" | Out-File -FilePath $env:GITHUB_PATH -Append`,
-      ];
-    case 'relic':
-      return [
-        `- name: Install relic (Azure Key Vault signing)
-  if: runner.os == 'Windows'
-  shell: pwsh
-  run: |
-    cargo install relic
-    echo "$env:USERPROFILE\\.cargo\\bin" | Out-File -FilePath $env:GITHUB_PATH -Append`,
-      ];
-    case 'sslcom':
-      return [
-        `- name: Install SSL.com eSigner CodeSignTool
-  if: runner.os == 'Windows'
-  shell: pwsh
-  run: |
-    Invoke-WebRequest -Uri "https://www.ssl.com/download/codesigntool/CodeSignTool-latest.zip" -OutFile CodeSignTool.zip
-    Expand-Archive CodeSignTool.zip -DestinationPath .
-    echo "$PWD\\CodeSignTool" | Out-File -FilePath $env:GITHUB_PATH -Append`,
-      ];
-    case 'jsign':
-      return [
-        `- name: Install jsign
-  if: runner.os == 'Windows'
-  shell: pwsh
-  run: |
-    Invoke-WebRequest -Uri "https://github.com/ebourg/jsign/releases/latest/download/jsign.jar" -OutFile jsign.jar
-    echo "JSIGN_JAR=$PWD\\jsign.jar" | Out-File -FilePath $env:GITHUB_ENV -Append`,
-      ];
-    default:
-      return [];
-  }
-}
-
-const WINDOWS_SIGN_SCRIPT = `$confPath = 'src-tauri/tauri.conf.json'
-$conf = Get-Content $confPath -Raw | ConvertFrom-Json
-if (-not $conf.bundle) { $conf | Add-Member -NotePropertyName bundle -NotePropertyValue ([pscustomobject]@{}) }
-if (-not $conf.bundle.windows) { $conf.bundle | Add-Member -NotePropertyName windows -NotePropertyValue ([pscustomobject]@{}) }
-$win = $conf.bundle.windows
-$win.PSObject.Properties.Remove('certificateThumbprint')
-$thumbprint = $null
-if ($env:WINDOWS_CERTIFICATE) {
-  $pfx = Join-Path $env:RUNNER_TEMP 'bini-certificate.pfx'
-  [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
-  $pw = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
-  $imported = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\\CurrentUser\\My -Password $pw
-  Remove-Item $pfx -Force
-  $thumbprint = ($imported | Where-Object { $_.HasPrivateKey } | Select-Object -First 1).Thumbprint
-  Write-Host 'Windows certificate imported.'
-} elseif ($env:WINDOWS_PUBLISHER) {
-  $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject ('CN=' + $env:WINDOWS_PUBLISHER) -CertStoreLocation Cert:\\CurrentUser\\My -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -NotAfter (Get-Date).AddYears(3)
-  $thumbprint = $cert.Thumbprint
-  Write-Host ('Created a self-signed certificate for ' + $env:WINDOWS_PUBLISHER + '.')
-  if ($env:GH_TOKEN) {
-    $pfxPassword = [guid]::NewGuid().ToString('N')
-    $pfx = Join-Path $env:RUNNER_TEMP 'bini-generated.pfx'
-    Export-PfxCertificate -Cert $cert -FilePath $pfx -Password (ConvertTo-SecureString $pfxPassword -AsPlainText -Force) | Out-Null
-    gh secret set WINDOWS_CERTIFICATE --repo $env:GITHUB_REPOSITORY --body ([Convert]::ToBase64String([IO.File]::ReadAllBytes($pfx)))
-    $certExit = $LASTEXITCODE
-    gh secret set WINDOWS_CERTIFICATE_PASSWORD --repo $env:GITHUB_REPOSITORY --body $pfxPassword
-    $pwExit = $LASTEXITCODE
-    Remove-Item $pfx -Force
-    if ($certExit -eq 0 -and $pwExit -eq 0) {
-      Write-Host 'Saved the certificate as a GitHub secret: later builds reuse it.'
-    } else {
-      Write-Host '::warning title=SECRETS_PAT could not save the certificate::gh secret set failed. This certificate is temporary and a new one will be created on every build. Check that SECRETS_PAT exists and has Secrets: Read and write for this repository.'
+/**
+ * Parses a POSIX single-quoted shell string (the format bini-cli writes to
+ * .env.signing). `'\''` is the escape for a literal single quote. Returns the
+ * decoded value, or null if the string is not (yet) a complete quoted value.
+ */
+function parseShellSingleQuoted(s: string): string | null {
+  if (!s.startsWith("'")) return null;
+  let out = '';
+  let i = 1;
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch === "'") {
+      if (s.slice(i, i + 4) === "'\\''") {
+        out += "'";
+        i += 4;
+        continue;
+      }
+      if (i === s.length - 1) return out;
+      return null;
     }
-  } else {
-    Write-Host 'No SECRETS_PAT secret: this certificate is temporary and a new one is created on every build.'
+    out += ch;
+    i++;
   }
-} elseif (Test-Path 'src-tauri/tauri.cloud-sign.conf.json') {
-  'BINI_TAURI_ARGS=--config src-tauri/tauri.cloud-sign.conf.json' | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-  Write-Host 'Using src-tauri/tauri.cloud-sign.conf.json for Windows cloud signing.'
-} else {
-  Write-Host 'No Windows signing secrets found: building an unsigned Windows app.'
-}
-if ($thumbprint) {
-  $win | Add-Member -NotePropertyName certificateThumbprint -NotePropertyValue $thumbprint -Force
-  $win | Add-Member -NotePropertyName digestAlgorithm -NotePropertyValue 'sha256' -Force
-  $win | Add-Member -NotePropertyName timestampUrl -NotePropertyValue 'http://timestamp.digicert.com' -Force
-}
-$conf | ConvertTo-Json -Depth 32 | Set-Content -Path $confPath -Encoding utf8`;
-
-function macosSignScript(): string {
-  const exportVar = (name: string): string => `  if [ -n "$${name}" ]; then echo "${name}=$${name}" >> "$GITHUB_ENV"; fi`;
-  return [
-    `identity=''`,
-    `if [ -n "$APPLE_CERTIFICATE" ] && [ -n "$APPLE_CERTIFICATE_PASSWORD" ]; then`,
-    `  identity="$APPLE_SIGNING_IDENTITY"`,
-    exportVar('APPLE_CERTIFICATE'),
-    exportVar('APPLE_CERTIFICATE_PASSWORD'),
-    exportVar('KEYCHAIN_PASSWORD'),
-    exportVar('APPLE_API_ISSUER'),
-    exportVar('APPLE_API_KEY'),
-    exportVar('APPLE_ID'),
-    exportVar('APPLE_PASSWORD'),
-    exportVar('APPLE_TEAM_ID'),
-    `  if [ -n "$APPLE_API_KEY_P8" ]; then`,
-    `    key_path="$RUNNER_TEMP/AuthKey.p8"`,
-    `    echo "$APPLE_API_KEY_P8" | base64 --decode > "$key_path"`,
-    `    echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"`,
-    `  fi`,
-    `else`,
-    `  echo "No macOS signing secrets found: building with an ad-hoc signature."`,
-    `fi`,
-    `if [ -z "$identity" ]; then identity='-'; fi`,
-    `echo "APPLE_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"`,
-    `tmp="$(mktemp)"`,
-    `jq --arg id "$identity" '.bundle.macOS.signingIdentity = $id' src-tauri/tauri.conf.json > "$tmp"`,
-    `mv "$tmp" src-tauri/tauri.conf.json`,
-  ].join('\n');
-}
-
-const LINUX_SIGN_SCRIPT = [
-  `key_id=''`,
-  `rpm_armored=''`,
-  `if [ -n "$GPG_PRIVATE_KEY" ]; then`,
-  `  echo "$GPG_PRIVATE_KEY" | base64 --decode | gpg --batch --import`,
-  `  echo "$GPG_PRIVATE_KEY" | base64 --decode > "$RUNNER_TEMP/rpm-signing-key.asc"`,
-  `  rpm_armored="$RUNNER_TEMP/rpm-signing-key.asc"`,
-  `  key_id="$SIGN_KEY"`,
-  `elif [ -n "$LINUX_PUBLISHER" ]; then`,
-  `  name="$LINUX_PUBLISHER"`,
-  `  if [ \${#name} -lt 5 ]; then name="$name App"; fi`,
-  `  printf '%s\\n' 'Key-Type: RSA' 'Key-Length: 4096' 'Subkey-Type: RSA' 'Subkey-Length: 4096' "Name-Real: $name" 'Expire-Date: 3y' '%no-protection' '%commit' > "$RUNNER_TEMP/gpg-batch"`,
-  `  gpg --batch --pinentry-mode loopback --gen-key "$RUNNER_TEMP/gpg-batch"`,
-  `  rm -f "$RUNNER_TEMP/gpg-batch"`,
-  `  key_id="$(gpg --list-secret-keys --with-colons --keyid-format LONG | awk -F: '/^sec:/ {print $5; exit}')"`,
-  `  gpg --batch --armor --export-secret-keys "$key_id" > "$RUNNER_TEMP/rpm-signing-key.asc"`,
-  `  rpm_armored="$RUNNER_TEMP/rpm-signing-key.asc"`,
-  `  echo "Created a GPG key for $LINUX_PUBLISHER."`,
-  `  if [ -n "$GH_TOKEN" ]; then`,
-  `    gpg --batch --armor --export-secret-keys "$key_id" | base64 -w0 > "$RUNNER_TEMP/gpg.b64"`,
-  `    gh secret set GPG_PRIVATE_KEY --repo "$GITHUB_REPOSITORY" < "$RUNNER_TEMP/gpg.b64"`,
-  `    key_exit=$?`,
-  `    printf '%s' "$key_id" | gh secret set SIGN_KEY --repo "$GITHUB_REPOSITORY"`,
-  `    id_exit=$?`,
-  `    rm -f "$RUNNER_TEMP/gpg.b64"`,
-  `    if [ "$key_exit" -eq 0 ] && [ "$id_exit" -eq 0 ]; then`,
-  `      echo "Saved the key as a GitHub secret: later builds reuse it."`,
-  `    else`,
-  `      echo "::warning title=SECRETS_PAT could not save the GPG key::gh secret set failed. This key is temporary and a new one will be created on every build. Check that SECRETS_PAT exists and has Secrets: Read and write for this repository."`,
-  `    fi`,
-  `  else`,
-  `    echo "No SECRETS_PAT secret: this key is temporary and a new one is created on every build."`,
-  `  fi`,
-  `fi`,
-  `if [ -z "$key_id" ]; then`,
-  `  echo "No Linux signing secrets found: the AppImage and RPM will be unsigned."`,
-  `  exit 0`,
-  `fi`,
-  `{ echo "SIGN=1"; echo "SIGN_KEY=$key_id"; echo "APPIMAGETOOL_FORCE_SIGN=1"; } >> "$GITHUB_ENV"`,
-  `if [ -n "$APPIMAGETOOL_SIGN_PASSPHRASE" ]; then`,
-  `  echo "APPIMAGETOOL_SIGN_PASSPHRASE=$APPIMAGETOOL_SIGN_PASSPHRASE" >> "$GITHUB_ENV"`,
-  `  echo "TAURI_SIGNING_RPM_KEY_PASSPHRASE=$APPIMAGETOOL_SIGN_PASSPHRASE" >> "$GITHUB_ENV"`,
-  `fi`,
-  `if [ -n "$rpm_armored" ] && [ -f "$rpm_armored" ]; then`,
-  `  {`,
-  `    echo "TAURI_SIGNING_RPM_KEY<<EOF"`,
-  `    cat "$rpm_armored"`,
-  `    echo "EOF"`,
-  `  } >> "$GITHUB_ENV"`,
-  `fi`,
-].join('\n');
-
-function buildDesktopWorkflow(info: PackageManagerInfo): string {
-  const pm = info.pm;
-  const cloudTool = detectCloudSignTool(process.cwd());
-
-  const steps: string[] = [
-    ...setupSteps(info),
-    ...cloudSignInstallSteps(cloudTool),
-    ...(cloudTool === 'unknown' ? [`- name: Warn about unknown Windows cloud signing tool
-  if: runner.os == 'Windows'
-  shell: pwsh
-  run: Write-Host '::warning title=Windows cloud signing tool not installed::tauri.cloud-sign.conf.json is present but the signCommand does not match a tool this workflow knows how to install. Add an install step for your vendor CLI (Azure Artifact Signing, Azure Key Vault/relic, SSL.com eSigner, jsign) or the Windows build will fail.'`] : []),
-    ...rustSteps(),
-    `- name: Install Linux dependencies
-  if: runner.os == 'Linux'
-  run: |
-    sudo apt-get update
-    sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev`,
-    installStep(info),
-    iconStep(pm),
-    `- name: Configure Windows signing
-  if: runner.os == 'Windows'
-  shell: pwsh
-  env:
-${indent(secretEnv(['WINDOWS_CERTIFICATE', 'WINDOWS_CERTIFICATE_PASSWORD', 'WINDOWS_PUBLISHER']), 4)}
-    GH_TOKEN: §{{ secrets.SECRETS_PAT }}
-  run: |
-${indent(WINDOWS_SIGN_SCRIPT, 4)}`,
-    `- name: Configure macOS signing
-  if: runner.os == 'macOS'
-  env:
-${indent(secretEnv(['APPLE_CERTIFICATE', 'APPLE_CERTIFICATE_PASSWORD', 'APPLE_SIGNING_IDENTITY', 'KEYCHAIN_PASSWORD', 'APPLE_API_ISSUER', 'APPLE_API_KEY', 'APPLE_API_KEY_P8', 'APPLE_ID', 'APPLE_PASSWORD', 'APPLE_TEAM_ID']), 4)}
-  run: |
-${indent(macosSignScript(), 4)}`,
-    `- name: Configure Linux signing
-  if: runner.os == 'Linux'
-  env:
-${indent(secretEnv(['GPG_PRIVATE_KEY', 'SIGN_KEY', 'APPIMAGETOOL_SIGN_PASSPHRASE', 'LINUX_PUBLISHER', 'APPIMAGETOOL_FORCE_SIGN', 'TAURI_SIGNING_RPM_KEY', 'TAURI_SIGNING_RPM_KEY_PASSPHRASE']), 4)}
-    GH_TOKEN: §{{ secrets.SECRETS_PAT }}
-  run: |
-${indent(LINUX_SIGN_SCRIPT, 4)}`,
-    versionStep(),
-    `- name: Build desktop app
-  env:
-    TAURI: 'true'
-  run: |
-    ${scriptCommand(pm, NATIVE_BUILD_SCRIPTS.desktop, ['§{{ env.BINI_TAURI_ARGS }}'])}`,
-    `- uses: ${ACTIONS.uploadArtifact}
-  with:
-    name: desktop-§{{ matrix.label }}
-    path: src-tauri/target/release/bundle/**
-    if-no-files-found: error`,
-    releaseStep([
-      'src-tauri/target/release/bundle/msi/*.msi',
-      'src-tauri/target/release/bundle/nsis/*.exe',
-      'src-tauri/target/release/bundle/dmg/*.dmg',
-      'src-tauri/target/release/bundle/macos/*.app.tar.gz',
-      'src-tauri/target/release/bundle/appimage/*.AppImage',
-      'src-tauri/target/release/bundle/deb/*.deb',
-      'src-tauri/target/release/bundle/rpm/*.rpm',
-    ]),
-  ];
-
-  const job = `concurrency:
-  group: desktop-§{{ github.ref }}
-  cancel-in-progress: true
-
-jobs:
-  build:
-    name: Build (§{{ matrix.label }})
-    runs-on: §{{ matrix.os }}
-    timeout-minutes: 60
-    defaults:
-      run:
-        shell: bash
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: windows-latest, label: Windows }
-          - { os: macos-latest, label: macOS }
-          - { os: ${LINUX_RUNNER}, label: Linux }`;
-
-  return renderWorkflow('name: Bini Desktop', job, steps, pm);
-}
-
-const ANDROID_SIGN_SCRIPT = [
-  `keystore="$RUNNER_TEMP/release.jks"`,
-  `alias="\${ANDROID_KEY_ALIAS:-upload}"`,
-  `if [ -x "./node_modules/.bin/create-bini-app" ]; then`,
-  `  CREATE_BINI_APP_CMD="./node_modules/.bin/create-bini-app"`,
-  `else`,
-  `  CREATE_BINI_APP_CMD="npx create-bini-app"`,
-  `fi`,
-  `if [ -n "$ANDROID_KEY_BASE64" ]; then`,
-  `  echo "$ANDROID_KEY_BASE64" | base64 --decode > "$keystore"`,
-  `elif [ -n "$ANDROID_PUBLISHER" ] && [ -n "$BINI_SIGN_PASSWORD" ]; then`,
-  `  keytool -genkeypair -keystore "$keystore" -keyalg RSA -keysize 2048 -validity 10000 -alias "$alias" -storepass:env BINI_SIGN_PASSWORD -keypass:env BINI_SIGN_PASSWORD -dname "CN=$ANDROID_PUBLISHER, OU=Dev, O=$ANDROID_PUBLISHER, C=US"`,
-  `  export BINI_KEY_PASSWORD="$BINI_SIGN_PASSWORD"`,
-  `  echo "Created a keystore for $ANDROID_PUBLISHER."`,
-  `  if [ -n "$GH_TOKEN" ]; then`,
-  `    base64 -w0 "$keystore" > "$RUNNER_TEMP/release.b64"`,
-  `    gh secret set ANDROID_KEY_BASE64 --repo "$GITHUB_REPOSITORY" < "$RUNNER_TEMP/release.b64"`,
-  `    secret_exit=$?`,
-  `    rm -f "$RUNNER_TEMP/release.b64"`,
-  `    if [ "$secret_exit" -eq 0 ]; then`,
-  `      echo "Saved the keystore as a GitHub secret: later builds reuse it."`,
-  `    else`,
-  `      echo "::warning title=SECRETS_PAT could not save the keystore::gh secret set failed. This keystore is temporary and a new one will be created on every build. Check that SECRETS_PAT exists and has Secrets: Read and write for this repository."`,
-  `    fi`,
-  `  else`,
-  `    echo "No SECRETS_PAT secret: this keystore is temporary and a new one is created on every build."`,
-  `  fi`,
-  `else`,
-  `  echo "No Android signing secrets found: the release build will be unsigned."`,
-  `  exit 0`,
-  `fi`,
-  `$CREATE_BINI_APP_CMD sign android "$keystore" --alias "$alias"`,
-].join('\n');
-
-function buildAndroidWorkflow(info: PackageManagerInfo): string {
-  const pm = info.pm;
-
-  const steps: string[] = [
-    ...setupSteps(info),
-    `- uses: ${ACTIONS.setupJava}
-  with:
-    distribution: temurin
-    java-version: '17'`,
-    ...rustSteps(['aarch64-linux-android', 'armv7-linux-androideabi', 'i686-linux-android', 'x86_64-linux-android']),
-    `- name: Select Android NDK
-  run: echo "NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"`,
-    installStep(info),
-    `- name: Initialize Android project (if missing)
-  run: |
-    if [ ! -d src-tauri/gen/android ]; then
-      ${scriptCommand(pm, 'tauri', ['android', 'init', '--ci'])}
-    fi`,
-    iconStep(pm),
-    `- name: Configure Android signing
-  env:
-${indent(secretEnv(['ANDROID_KEY_BASE64', 'ANDROID_KEY_ALIAS', 'ANDROID_PUBLISHER']), 4)}
-    BINI_SIGN_PASSWORD: §{{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-    BINI_KEY_PASSWORD: §{{ secrets.ANDROID_KEY_PASSWORD }}
-    GH_TOKEN: §{{ secrets.SECRETS_PAT }}
-  run: |
-${indent(ANDROID_SIGN_SCRIPT, 4)}`,
-    versionStep(),
-    `- name: Build Android app
-  run: |
-    ${scriptCommand(pm, NATIVE_BUILD_SCRIPTS.android)}`,
-    `- uses: ${ACTIONS.uploadArtifact}
-  with:
-    name: android
-    path: |
-      src-tauri/gen/android/app/build/outputs/**/*.apk
-      src-tauri/gen/android/app/build/outputs/**/*.aab
-    if-no-files-found: error`,
-    releaseStep([
-      'src-tauri/gen/android/app/build/outputs/apk/**/*.apk',
-      'src-tauri/gen/android/app/build/outputs/bundle/**/*.aab',
-    ]),
-  ];
-
-  const job = `concurrency:
-  group: android-§{{ github.ref }}
-  cancel-in-progress: true
-
-jobs:
-  build:
-    name: Build (Android)
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    defaults:
-      run:
-        shell: bash`;
-
-  return renderWorkflow('name: Bini Android', job, steps, pm);
-}
-
-function buildIosWorkflow(info: PackageManagerInfo): string {
-  const pm = info.pm;
-
-  const signedBuild = scriptCommand(pm, NATIVE_BUILD_SCRIPTS.ios, ['--export-method', 'app-store-connect']);
-  const simulatorBuild = scriptCommand(pm, NATIVE_BUILD_SCRIPTS.ios, ['--target', 'aarch64-sim']);
-
-  const steps: string[] = [
-    ...setupSteps(info),
-    ...rustSteps(['aarch64-apple-ios', 'aarch64-apple-ios-sim', 'x86_64-apple-ios']),
-    installStep(info),
-    `- name: Initialize iOS project (if missing)
-  run: |
-    if [ ! -d src-tauri/gen/apple ]; then
-      ${scriptCommand(pm, 'tauri', ['ios', 'init', '--ci'])}
-    fi`,
-    iconStep(pm),
-    versionStep(),
-    `- name: Build iOS app
-  id: build
-  env:
-${indent(secretEnv(['IOS_CERTIFICATE', 'IOS_CERTIFICATE_PASSWORD', 'IOS_MOBILE_PROVISION', 'APPLE_DEVELOPMENT_TEAM', 'APPLE_API_ISSUER', 'APPLE_API_KEY', 'APPLE_API_KEY_P8']), 4)}
-  run: |
-    set -eu
-
-    have_api=false
-    if [ -n "$APPLE_API_KEY_P8" ] && [ -n "$APPLE_API_KEY" ] && [ -n "$APPLE_API_ISSUER" ]; then
-      key_path="$RUNNER_TEMP/AuthKey.p8"
-      echo "$APPLE_API_KEY_P8" | base64 --decode > "$key_path"
-      export APPLE_API_KEY_PATH="$key_path"
-      have_api=true
-    fi
-
-    have_cert=false
-    if [ -n "$IOS_CERTIFICATE" ] && [ -n "$IOS_CERTIFICATE_PASSWORD" ] && [ -n "$IOS_MOBILE_PROVISION" ]; then
-      have_cert=true
-    fi
-
-    if [ "$have_api" = true ] && [ "$have_cert" = true ]; then
-      echo "Building a signed IPA with the provided certificate and provisioning profile."
-      ${signedBuild}
-      echo "signed=true" >> "$GITHUB_OUTPUT"
-    elif [ "$have_api" = true ] && [ -n "$APPLE_DEVELOPMENT_TEAM" ]; then
-      echo "Using Xcode automatic signing with the App Store Connect API key."
-      ${signedBuild}
-      echo "signed=true" >> "$GITHUB_OUTPUT"
-    else
-      echo "No complete iOS signing setup found: building for the simulator only."
-      unset IOS_CERTIFICATE IOS_CERTIFICATE_PASSWORD IOS_MOBILE_PROVISION
-      unset APPLE_DEVELOPMENT_TEAM APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_P8 APPLE_API_KEY_PATH
-      tmp="$(mktemp)"
-      jq 'del(.bundle.iOS.developmentTeam)' src-tauri/tauri.conf.json > "$tmp"
-      mv "$tmp" src-tauri/tauri.conf.json
-      ${simulatorBuild}
-      echo "signed=false" >> "$GITHUB_OUTPUT"
-    fi`,
-    `- name: Package simulator app
-  if: steps.build.outputs.signed == 'false'
-  run: |
-    app="$(find src-tauri/gen/apple/build -maxdepth 4 -type d -name '*.app' | head -n1)"
-    if [ -z "$app" ]; then
-      echo "::error title=No .app found::The simulator build produced no .app bundle."
-      exit 1
-    fi
-    cd "$(dirname "$app")"
-    zip -r -y "$GITHUB_WORKSPACE/ios-simulator.zip" "$(basename "$app")"`,
-    `- name: Upload simulator build
-  if: steps.build.outputs.signed == 'false'
-  uses: ${ACTIONS.uploadArtifact}
-  with:
-    name: ios-simulator
-    path: ios-simulator.zip
-    if-no-files-found: error`,
-    `- name: Upload IPA
-  if: steps.build.outputs.signed == 'true'
-  uses: ${ACTIONS.uploadArtifact}
-  with:
-    name: ios
-    path: src-tauri/gen/apple/build/**/*.ipa
-    if-no-files-found: error`,
-    releaseStep(
-      ['src-tauri/gen/apple/build/**/*.ipa'],
-      `steps.build.outputs.signed == 'true'`,
-    ),
-  ];
-
-  const job = `concurrency:
-  group: ios-§{{ github.ref }}
-  cancel-in-progress: true
-
-jobs:
-  build:
-    name: Build (iOS)
-    runs-on: macos-latest
-    timeout-minutes: 60
-    defaults:
-      run:
-        shell: bash`;
-
-  return renderWorkflow('name: Bini iOS', job, steps, pm);
-}
-
-function generateWorkflows(targets: NativePlatform[]): string[] {
-  const cwd = process.cwd();
-  const info = detectPackageManager();
-  const dir = path.join(cwd, WORKFLOWS_DIR);
-  mkdirSync(dir, { recursive: true });
-
-  const builders: Record<NativePlatform, (i: PackageManagerInfo) => string> = {
-    desktop: buildDesktopWorkflow,
-    android: buildAndroidWorkflow,
-    ios: buildIosWorkflow,
-  };
-
-  const written: string[] = [];
-  for (const target of targets) {
-    const file = path.join(dir, WORKFLOW_FILES[target]);
-    writeFileSync(file, builders[target](info), 'utf8');
-    written.push(toPosixPath(path.relative(cwd, file)));
-  }
-  return written;
-}
-
-function assertNativeProject(targets: NativePlatform[]): void {
-  const cwd = process.cwd();
-  if (!existsSync(path.join(cwd, 'src-tauri', 'tauri.conf.json'))) {
-    throw new Error(
-      'No Tauri project found (src-tauri/tauri.conf.json is missing).\n' +
-      '  Add one first: create-bini-app add <desktop|android|ios>\n' +
-      '  No Mac? Run `add desktop` (it creates the shared src-tauri/): the iOS project itself is generated in CI.'
-    );
-  }
-
-  const scripts = (readPackageJson()?.scripts ?? {}) as Record<string, string>;
-  const missing = targets.filter((t) => !scripts[NATIVE_BUILD_SCRIPTS[t]]);
-  if (missing.length > 0) {
-    throw new Error(
-      `package.json has no "${missing.map((t) => NATIVE_BUILD_SCRIPTS[t]).join('", "')}" script.\n` +
-      `  Add the native scripts: create-bini-app add ${missing.join(' ')}`
-    );
-  }
-}
-
-const SIGNING_ENV_FILE = '.env.signing';
-
-const SIGNING_GITIGNORE = [
-  '.env.signing',
-  '.bini-signing/',
-  'tauri.windows.conf.json',
-  'tauri.macos.conf.json',
-  'tauri.ios.conf.json',
-  '*.jks',
-  '*.keystore',
-  '*.p12',
-  '*.pfx',
-  '*.p8',
-  '*.mobileprovision',
-  '*.key',
-  'keystore.properties',
-];
-
-const SIGNING_SECRETS: Record<SigningTarget, string[]> = {
-  windows: ['WINDOWS_CERTIFICATE', 'WINDOWS_CERTIFICATE_PASSWORD', 'WINDOWS_PUBLISHER'],
-  macos: [
-    'APPLE_CERTIFICATE', 'APPLE_CERTIFICATE_PASSWORD', 'APPLE_SIGNING_IDENTITY', 'KEYCHAIN_PASSWORD',
-    'APPLE_API_ISSUER', 'APPLE_API_KEY', 'APPLE_API_KEY_P8',
-    'APPLE_ID', 'APPLE_PASSWORD', 'APPLE_TEAM_ID',
-  ],
-  linux: [
-    'GPG_PRIVATE_KEY', 'SIGN_KEY', 'APPIMAGETOOL_SIGN_PASSPHRASE', 'LINUX_PUBLISHER',
-    'APPIMAGETOOL_FORCE_SIGN',
-    'TAURI_SIGNING_RPM_KEY', 'TAURI_SIGNING_RPM_KEY_PASSPHRASE',
-  ],
-  android: ['ANDROID_KEY_BASE64', 'ANDROID_KEY_ALIAS', 'ANDROID_KEY_PASSWORD', 'ANDROID_KEYSTORE_PASSWORD', 'ANDROID_PUBLISHER'],
-  ios: [
-    'IOS_CERTIFICATE', 'IOS_CERTIFICATE_PASSWORD', 'IOS_MOBILE_PROVISION', 'APPLE_DEVELOPMENT_TEAM',
-    'APPLE_API_ISSUER', 'APPLE_API_KEY', 'APPLE_API_KEY_P8',
-  ],
-};
-
-const SIGNING_MARKERS: Record<SigningTarget, string[]> = {
-  windows: ['WINDOWS_CERTIFICATE', 'WINDOWS_PUBLISHER'],
-  macos: ['APPLE_CERTIFICATE'],
-  linux: ['GPG_PRIVATE_KEY', 'LINUX_PUBLISHER'],
-  android: ['ANDROID_KEY_BASE64', 'ANDROID_PUBLISHER'],
-  ios: ['IOS_CERTIFICATE', 'APPLE_API_KEY'],
-};
-
-const SIGNING_LABELS: Record<SigningTarget, string> = {
-  windows: 'Windows',
-  macos: 'macOS',
-  linux: 'Linux',
-  android: 'Android',
-  ios: 'iOS',
-};
-
-function signingTargetsFor(targets: NativePlatform[]): SigningTarget[] {
-  const list: SigningTarget[] = [];
-  if (targets.includes('desktop')) list.push('windows', 'macos', 'linux');
-  if (targets.includes('android')) list.push('android');
-  if (targets.includes('ios')) list.push('ios');
-  return list;
+  return null;
 }
 
 function readSigningEnv(): Record<string, string> {
@@ -1746,284 +1061,306 @@ function readSigningEnv(): Record<string, string> {
   const out: Record<string, string> = {};
   if (!existsSync(file)) return out;
 
+  let text: string;
   try {
-    for (const raw of readFileSync(file, 'utf8').split(/\r?\n/)) {
-      const match = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(raw);
-      if (!match) continue;
-      let value = match[2] ?? '';
-      if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) {
-        value = value.slice(1, -1).replace(/'\\''/g, "'");
-      }
-      out[match[1] as string] = value;
-    }
+    text = readFileSync(file, 'utf8');
   } catch {
     // unreadable file: treated as no values
+    return out;
+  }
+
+  const lines = text.split(/\r?\n/);
+  let i = 0;
+  while (i < lines.length) {
+    const raw = lines[i] ?? '';
+    const match = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(raw);
+    if (!match) {
+      i++;
+      continue;
+    }
+    const key = match[1] as string;
+    const rest = match[2] ?? '';
+
+    if (rest.startsWith("'")) {
+      // Keep consuming lines until the quoted value closes (multi-line values,
+      // e.g. the ASCII-armored TAURI_SIGNING_RPM_KEY).
+      let accumulated = rest;
+      while (parseShellSingleQuoted(accumulated) === null && i + 1 < lines.length) {
+        i++;
+        accumulated += '\n' + (lines[i] ?? '');
+      }
+      out[key] = parseShellSingleQuoted(accumulated) ?? accumulated;
+    } else {
+      out[key] = rest;
+    }
+    i++;
   }
   return out;
 }
 
-function isSigned(target: SigningTarget, env: Record<string, string>): boolean {
-  if (SIGNING_MARKERS[target].some((name) => env[name])) return true;
-  return target === 'windows' && existsSync(path.join(process.cwd(), 'src-tauri', 'tauri.cloud-sign.conf.json'));
-}
-
-function ensureSigningIgnored(): void {
-  const gitignorePath = path.join(process.cwd(), '.gitignore');
-  let existing = '';
-  try {
-    existing = readFileSync(gitignorePath, 'utf8');
-  } catch {
-    // no .gitignore yet
-  }
-
-  const have = new Set(existing.split('\n').map((l) => l.trim()));
-  const missing = SIGNING_GITIGNORE.filter((entry) => !have.has(entry));
-  if (missing.length === 0) return;
-
-  const prefix = existing.length > 0 && !existing.endsWith('\n') ? '\n' : '';
-  writeFileSync(gitignorePath, `${existing}${prefix}${missing.join('\n')}\n`, 'utf8');
-  log.info('Added signing files to .gitignore so secrets are never pushed');
-}
-
-interface CmdResult {
-  code: number | null;
-  stdout: string;
-  stderr: string;
-}
-
-function runCmd(cmd: string, args: string[], opts: { input?: string } = {}): Promise<CmdResult> {
-  return new Promise((resolve) => {
-    let child: ReturnType<typeof crossSpawn>;
-    try {
-      child = crossSpawn(cmd, args, { cwd: process.cwd(), windowsHide: true, stdio: 'pipe' });
-    } catch (err) {
-      resolve({ code: null, stdout: '', stderr: err instanceof Error ? err.message : String(err) });
-      return;
-    }
-
-    let stdout = '';
-    let stderr = '';
-    child.stdout?.on('data', (chunk) => {
-      stdout += chunk.toString();
-    });
-    child.stderr?.on('data', (chunk) => {
-      stderr += chunk.toString();
-    });
-    child.on('error', (err) => resolve({ code: null, stdout, stderr: stderr + err.message }));
-    child.on('exit', (code) => resolve({ code, stdout, stderr }));
-
-    if (opts.input !== undefined) child.stdin?.write(opts.input);
-    child.stdin?.end();
-  });
-}
-
-function resolveCreateBiniAppCli(): { bin: string; args: string[] } | null {
-  const binName = process.platform === 'win32' ? 'create-bini-app.cmd' : 'create-bini-app';
-  const local = path.join(process.cwd(), 'node_modules', '.bin', binName);
-  if (existsSync(local)) return { bin: local, args: [] };
-  return null;
-}
-
-function createBiniAppCommand(subargs: string[]): { bin: string; args: string[] } {
-  const local = resolveCreateBiniAppCli();
-  if (local) return { bin: local.bin, args: subargs };
-  return { bin: 'npx', args: ['create-bini-app', ...subargs] };
-}
-
-function runSignCli(target: SigningTarget): Promise<boolean> {
-  const { bin, args } = createBiniAppCommand(['sign', target, '--ci-only']);
-  log.command(`${bin} ${args.join(' ')}`);
-
-  return new Promise((resolve) => {
-    const child = crossSpawn(bin, args, { cwd: process.cwd(), stdio: 'inherit', windowsHide: true });
-    child.on('error', () => resolve(false));
-    child.on('exit', (code) => resolve(code === 0));
-  });
-}
-
-async function ensureSigning(targets: NativePlatform[], skipPrompts: boolean): Promise<void> {
-  const list = signingTargetsFor(targets);
-  if (list.length === 0) return;
-
-  const interactive = !skipPrompts && isInteractive();
-
-  for (const target of list) {
-    const label = SIGNING_LABELS[target];
-    const signed = isSigned(target, readSigningEnv());
-
-    if (!interactive) {
-      if (!signed) {
-        log.warn(`${label}: no signing values found, CI will build it unsigned. Set it up with: create-bini-app sign ${target} --ci-only`);
-      }
-      continue;
-    }
-
-    if (signed) {
-      log.skip(`${label}: signing already configured, skipping the prompt.`);
-      continue;
-    }
-
-    const run = await confirm({
-      message: `${label}: set up signing for GitHub Actions now?`,
-      default: true,
-    });
-    if (!run) {
-      log.skip(`${label}. CI will build it unsigned.`);
-      continue;
-    }
-
-    if (!(await runSignCli(target))) {
-      log.warn(`${label} signing did not finish. CI will build it unsigned until you run: create-bini-app sign ${target} --ci-only`);
-    }
-  }
-}
-
-const GENERATED_PUBLISHERS = ['WINDOWS_PUBLISHER', 'LINUX_PUBLISHER', 'ANDROID_PUBLISHER'];
-
-async function ensureSecretsPat(githubRepo: string, skipPrompts: boolean): Promise<void> {
+function uploadSecrets(githubRepo: string, targets?: NativeTarget[]): void {
   const env = readSigningEnv();
-  if (!GENERATED_PUBLISHERS.some((name) => env[name])) return;
-
   const slug = githubRepo.replace(/^https:\/\/github\.com\//, '');
-  const list = await runCmd('gh', ['secret', 'list', '--repo', slug]);
-  if (list.code === 0 && /^SECRETS_PAT\s/m.test(list.stdout)) return;
 
-  const manual = (): void => {
-    log.warn('SECRETS_PAT is not set, so generated signing keys are temporary and a new one is created on every build.');
-    log.info(`Create a fine-grained token for this repository with "Secrets: Read and write", then add it as ${c.yellow('SECRETS_PAT')} at https://github.com/${slug}/settings/secrets/actions`);
-  };
-
-  if (list.code !== 0 || skipPrompts || !isInteractive()) {
-    manual();
+  if (Object.keys(env).length === 0) {
+    log.warn(`No ${SIGNING_ENV_FILE} found. CI builds will be unsigned.`);
+    log.info('Set up signing first: create-bini-app sign <target>');
     return;
   }
 
-  try {
-    const add = await confirm({ message: 'Add SECRETS_PAT now so the workflow can save generated keys and reuse them?', default: true });
-    if (!add) {
-      manual();
-      return;
+  let names = Object.keys(env);
+  if (targets) {
+    const allowed = new Set<string>();
+    for (const target of Object.keys(SECRET_GROUPS) as SigningTarget[]) {
+      if (targets.includes(SIGNING_PLATFORM[target])) {
+        for (const name of SECRET_GROUPS[target]) allowed.add(name);
+      }
     }
-    const token = await password({
-      message: 'Token (fine-grained, this repository, Secrets: Read and write):',
-      validate: (v: string) => v.trim().length > 0 || 'Token is required',
-    });
-    const result = await runCmd('gh', ['secret', 'set', 'SECRETS_PAT', '--repo', slug], { input: token.trim() });
-    if (result.code === 0) log.success('SECRETS_PAT saved. Generated keys are created once and reused.');
-    else manual();
-  } catch (err) {
-    if (isExitPromptError(err)) return;
-    throw err;
-  }
-}
-
-async function uploadSigningSecrets(githubRepo: string, targets: NativePlatform[], skipPrompts: boolean): Promise<void> {
-  const env = readSigningEnv();
-  const names: string[] = [];
-  for (const target of signingTargetsFor(targets)) {
-    for (const name of SIGNING_SECRETS[target]) {
-      if (env[name] && !names.includes(name)) names.push(name);
-    }
+    names = names.filter((name) => allowed.has(name));
   }
 
   if (names.length === 0) {
-    log.info(`No signing values in ${SIGNING_ENV_FILE}, so no GitHub secrets were uploaded. CI builds will be unsigned.`);
+    log.warn('No values in .env.signing match the selected targets. Nothing to upload.');
     return;
   }
 
-  const slug = githubRepo.replace(/^https:\/\/github\.com\//, '');
-  const manual = (): void => {
-    log.warn('Could not upload the signing secrets automatically. Add them in the repository settings:');
-    log.info(`https://github.com/${slug}/settings/secrets/actions`);
-    log.info(`Names: ${names.join(', ')}`);
-    log.info('Or install the GitHub CLI (gh), run `gh auth login`, and run deploy again.');
-  };
-
-  const auth = await runCmd('gh', ['auth', 'status']);
-  if (auth.code !== 0) {
-    manual();
+  const ghCheck = spawnSync('gh', ['--version'], { stdio: 'ignore' });
+  if (ghCheck.error || ghCheck.status !== 0) {
+    log.error('GitHub CLI (gh) was not found or is not working. Install it and run `gh auth login`.');
+    log.plain(`\n${c.dim('Or add the secrets manually at:')}`);
+    log.plain(`  ${c.cyan(`https://github.com/${slug}/settings/secrets/actions`)}\n`);
     return;
   }
 
-  if (!skipPrompts && isInteractive()) {
-    try {
-      const ok = await confirm({
-        message: `Upload ${names.length} signing secret(s) from ${SIGNING_ENV_FILE} to ${slug}?`,
-        default: true,
-      });
-      if (!ok) {
-        log.skip(`Upload cancelled. Run deploy again later, or add them at https://github.com/${slug}/settings/secrets/actions`);
-        return;
-      }
-    } catch (err) {
-      if (isExitPromptError(err)) return;
-      throw err;
-    }
-  }
+  log.plain(`\n${c.heading('Uploading repository secrets')}`);
 
   let uploaded = 0;
   for (const name of names) {
-    const result = await runCmd('gh', ['secret', 'set', name, '--repo', slug], { input: env[name] });
-    if (result.code === 0) {
-      uploaded++;
+    let value = env[name];
+    if (value === undefined) continue;
+
+    // 1. readSigningEnv() already decoded the shell quoting; do not strip quotes again.
+    // 2. Normalize line endings to prevent GitHub Actions errors with \r\n
+    value = value.replace(/\r\n/g, '\n');
+
+    // 3. Clean up the RPM Key formatting (strip any trailing whitespace)
+    if (name === 'TAURI_SIGNING_RPM_KEY' || name === 'GPG_PRIVATE_KEY') {
+      value = value.trim();
+    }
+
+    log.info(`Uploading secret: ${name}...`);
+
+    // 4. Spawn gh secret set, piping the clean value directly to stdin
+    const result = spawnSync('gh', ['secret', 'set', name, '-R', slug], {
+      input: value,
+      stdio: ['pipe', 'ignore', 'pipe'],
+      encoding: 'utf8',
+    });
+
+    if (result.error || result.status !== 0) {
+      const errorMsg = result.stderr || result.error?.message || 'Unknown error';
+      log.error(`  Failed to upload ${name}: ${String(errorMsg).trim()}`);
     } else {
-      log.warn(`Could not set ${name}: ${(result.stderr || 'gh failed').trim().split('\n').pop()}`);
+      log.success(`  Success: ${name}`);
+      uploaded++;
     }
   }
 
-  if (uploaded === names.length) log.success(`Uploaded ${uploaded} signing secret(s) to GitHub`);
-  else log.warn(`Uploaded ${uploaded} of ${names.length} signing secret(s). Add the rest at https://github.com/${slug}/settings/secrets/actions`);
+  if (uploaded === names.length) {
+    log.success(`All ${uploaded} secrets successfully uploaded to GitHub!`);
+  } else {
+    log.warn(`Uploaded ${uploaded}/${names.length} secrets.`);
+    log.plain(`\n${c.dim('You may need to add the missing ones manually at:')}`);
+    log.plain(`  ${c.cyan(`https://github.com/${slug}/settings/secrets/actions`)}\n`);
+  }
 }
 
-interface GitResult {
-  code: number | null;
-  stdout: string;
-  stderr: string;
+/* ─────────────── Signing helper (runs create-bini-app sign) ─────────────── */
+
+function createBiniAppCommand(args: string[]): { bin: string; args: string[] } {
+  const binName = process.platform === 'win32' ? 'create-bini-app.cmd' : 'create-bini-app';
+  const local = path.join(process.cwd(), 'node_modules', '.bin', binName);
+  if (existsSync(local)) return { bin: local, args };
+
+  const pm = detectPackageManager();
+  switch (pm) {
+    case 'pnpm':
+      return { bin: 'pnpm', args: ['dlx', 'create-bini-app', ...args] };
+    case 'yarn':
+      return { bin: 'yarn', args: ['dlx', 'create-bini-app', ...args] };
+    case 'bun':
+      return { bin: 'bunx', args: ['create-bini-app', ...args] };
+    case 'npm':
+    default:
+      return { bin: 'npx', args: ['--yes', '--silent', 'create-bini-app', ...args] };
+  }
 }
 
-function runGit(args: string[], opts: { inherit?: boolean } = {}): Promise<GitResult> {
-  return new Promise((resolve, reject) => {
-    const child = crossSpawn('git', args, {
-      cwd: process.cwd(),
-      windowsHide: true,
-      stdio: opts.inherit ? ['inherit', 'pipe', 'pipe'] : 'pipe',
-    });
-    let stdout = '';
-    let stderr = '';
-    child.stdout?.on('data', (chunk) => {
-      const text = chunk.toString();
-      stdout += text;
-      if (opts.inherit) process.stdout.write(text);
-    });
-    child.stderr?.on('data', (chunk) => {
-      const text = chunk.toString();
-      stderr += text;
-      if (opts.inherit) process.stderr.write(text);
-    });
-    child.on('error', (err) => reject(err));
-    child.on('exit', (code) => resolve({ code, stdout, stderr }));
-  });
-}
+function runCreateBiniAppSign(args: string[]): Promise<boolean> {
+  const { bin, args: fullArgs } = createBiniAppCommand(args);
+  log.command(`${bin} ${fullArgs.join(' ')}`);
 
-function getGitConfig(key: string): Promise<string | null> {
   return new Promise((resolve) => {
-    const child = crossSpawn('git', ['config', key], {
+    const child = crossSpawn(bin, fullArgs, {
       cwd: process.cwd(),
+      stdio: 'inherit',
       windowsHide: true,
     });
-    let output = '';
-    child.stdout?.on('data', (chunk) => {
-      output += chunk.toString();
-    });
-    child.on('error', () => resolve(null));
-    child.on('exit', (code) => resolve(code === 0 ? output.trim() : null));
+    child.on('error', () => resolve(false));
+    child.on('exit', (code: number | null) => resolve(code === 0));
   });
+}
+
+async function askForSigningTargets(answers: DeployAnswers): Promise<void> {
+  const candidateTargets = (Object.keys(SIGNING_LABELS) as SigningTarget[]).filter((t) =>
+    answers.targets.includes(SIGNING_PLATFORM[t]),
+  );
+
+  for (const target of candidateTargets) {
+    const label = SIGNING_LABELS[target];
+    const sign = await confirm({
+      message: `Sign ${label} for GitHub Actions?`,
+      default: true,
+    });
+    if (!sign) {
+      log.skip(`${label}: signing skipped.`);
+      continue;
+    }
+
+    // Prerequisite checks (e.g. gpg for Linux) are owned by bini-cli, which
+    // prints the install guide itself when something is missing.
+    if (!(await runCreateBiniAppSign(['sign', target, '--ci-only']))) {
+      log.warn(`${label} signing did not finish. CI builds for that target will be unsigned.`);
+    }
+  }
+}
+
+function writeWorkflows(targets: NativeTarget[], dryRun: boolean): string[] {
+  const cwd = process.cwd();
+  const dir = path.join(cwd, '.github', 'workflows');
+  const templates = path.join(__dirname, '..', 'templates', 'workflows');
+  const written: string[] = [];
+
+  for (const target of targets) {
+    const src = path.join(templates, WORKFLOW_FILES[target]);
+    const dest = path.join(dir, WORKFLOW_FILES[target]);
+    if (!existsSync(src)) {
+      throw new Error(`Missing workflow template: ${src}`);
+    }
+    if (!dryRun) {
+      mkdirSync(dir, { recursive: true });
+      copyFileSync(src, dest);
+    }
+    written.push(toPosixPath(path.relative(cwd, dest)));
+  }
+
+  return written;
+}
+
+function isBiniProject(cwd: string): boolean {
+  try {
+    const pkg = JSON.parse(readFileSync(path.join(cwd, 'package.json'), 'utf8')) as Record<string, any>;
+    return Boolean(pkg.dependencies?.['bini-router'] || pkg.devDependencies?.['bini-router']);
+  } catch {
+    return false;
+  }
+}
+
+function verifyNativeProject(targets: NativeTarget[]): void {
+  const cwd = process.cwd();
+
+  if (!isBiniProject(cwd)) {
+    log.warn('This does not look like a Bini.js project (bini-router missing in package.json).');
+  }
+
+  if (!existsSync(path.join(cwd, 'src-tauri', 'tauri.conf.json'))) {
+    throw new Error(
+      'No Tauri project found (src-tauri/tauri.conf.json is missing).\n' +
+        '  Add one first: create-bini-app add <desktop|android|ios>\n' +
+        '  No Mac? Run `add desktop` (it creates the shared src-tauri/): the iOS project itself is generated in CI.',
+    );
+  }
+
+  const pkg = readPackageJson();
+  const deps: Record<string, string> = {
+    ...((pkg?.dependencies ?? {}) as Record<string, string>),
+    ...((pkg?.devDependencies ?? {}) as Record<string, string>),
+  };
+
+  if (!deps['@tauri-apps/cli']) {
+    throw new Error('@tauri-apps/cli is not installed.\n  Run: create-bini-app add <desktop|android|ios>');
+  }
+
+  const scripts = (pkg?.scripts ?? {}) as Record<string, string>;
+  const missing = targets.filter((t) => !scripts[`tauri:${t === 'desktop' ? 'build' : `${t}:build`}`] && !scripts[`${t}:build`]);
+  if (missing.length > 0) {
+    log.warn(`package.json is missing build scripts for ${missing.join(', ')}. Local builds may need: create-bini-app add ${missing.join(' ')}`);
+  }
+}
+
+async function deployNative(answers: DeployAnswers, dryRun: boolean): Promise<void> {
+  const spinner = clack.spinner();
+  spinner.start('Preparing native deploy...');
+
+  try {
+    verifyNativeProject(answers.targets);
+
+    spinner.message('Writing workflow templates...');
+    const written = writeWorkflows(answers.targets, dryRun);
+    for (const f of written) log.info(`${dryRun ? 'Would write' : 'Wrote'} ${f}`);
+
+    spinner.stop();
+
+    const missingSigning = Object.keys(readSigningEnv()).length === 0;
+    if (missingSigning && !dryRun) {
+      if (answers.skipPrompts || !isInteractive()) {
+        log.warn(`No ${SIGNING_ENV_FILE} found. CI builds will be unsigned.`);
+        log.info('Set up signing first: create-bini-app sign <target> --ci-only');
+      } else {
+        const proceed = await confirm({
+          message: `No ${SIGNING_ENV_FILE} found. Run create-bini-app sign now?`,
+          default: true,
+        });
+        if (proceed) await askForSigningTargets(answers);
+      }
+    } else if (missingSigning && dryRun) {
+      log.warn(`No ${SIGNING_ENV_FILE} found. A real run would invoke create-bini-app sign.`);
+    }
+
+    log.plain('');
+    if (dryRun) {
+      log.info('Dry run: would upload signing secrets with `gh secret set`.');
+    } else {
+      uploadSecrets(answers.githubRepo, answers.targets);
+    }
+
+    if (dryRun) {
+      log.plain(`\n${c.yellow('Dry run:')} no files pushed.`);
+      return;
+    }
+
+    log.step('Pushing to GitHub...');
+    await pushToGitHub(answers.githubRepo, {
+      commitMessage: answers.commitMessage,
+      interactive: !answers.skipPrompts && isInteractive(),
+    });
+    log.success('Native deploy complete.');
+  } catch (error) {
+    spinner.stop();
+    throw error;
+  }
+}
+
+/* ─────────────────────────── Git helpers ─────────────────────────── */
+
+function makeGit(): SimpleGit {
+  return simpleGit({ baseDir: process.cwd() });
 }
 
 type GitFailureKind = 'auth' | 'not-found' | 'non-fast-forward' | 'unknown';
 
-function classifyGitError(stderr: string): GitFailureKind {
-  const text = stderr.toLowerCase();
+function classifyGitError(message: string): GitFailureKind {
+  const text = message.toLowerCase();
 
   if (
     text.includes('authentication failed') ||
@@ -2032,6 +1369,8 @@ function classifyGitError(stderr: string): GitFailureKind {
     text.includes('terminal prompts disabled') ||
     text.includes('permission denied') ||
     text.includes('403') ||
+    text.includes('could not read from remote repository') ||
+    text.includes('support for password authentication') ||
     (text.includes('workflow') && text.includes('scope'))
   ) {
     return 'auth';
@@ -2045,42 +1384,38 @@ function classifyGitError(stderr: string): GitFailureKind {
     return 'not-found';
   }
 
-  if (
-    text.includes('non-fast-forward') ||
-    text.includes('fetch first') ||
-    text.includes('updates were rejected')
-  ) {
+  if (text.includes('non-fast-forward') || text.includes('fetch first') || text.includes('updates were rejected')) {
     return 'non-fast-forward';
   }
 
   return 'unknown';
 }
 
-async function ensureGitIdentity(): Promise<void> {
+async function ensureGitIdentity(git: SimpleGit): Promise<void> {
   const [existingName, existingEmail] = await Promise.all([
-    getGitConfig('user.name'),
-    getGitConfig('user.email'),
+    git.getConfig('user.name').catch(() => null),
+    git.getConfig('user.email').catch(() => null),
   ]);
 
-  if (existingName && existingEmail) return;
+  const name = existingName?.value ?? null;
+  const email = existingEmail?.value ?? null;
+
+  if (name && email) return;
 
   if (!isInteractive()) {
-    const missing = [
-      !existingName ? 'user.name' : null,
-      !existingEmail ? 'user.email' : null,
-    ].filter(Boolean).join(' and ');
+    const missing = [!name ? 'user.name' : null, !email ? 'user.email' : null].filter(Boolean).join(' and ');
     throw new Error(
       `Git identity is not configured (missing ${missing}) and no terminal is available to prompt for it.\n` +
-      `Configure it first, e.g.:\n` +
-      `  git config --global user.name "Your Name"\n` +
-      `  git config --global user.email "you@example.com"`
+        `Configure it first, e.g.:\n` +
+        `  git config --global user.name "Your Name"\n` +
+        `  git config --global user.email "you@example.com"`,
     );
   }
 
   log.warn('Git author identity is not set - needed to create a commit.');
 
-  let gitName = existingName;
-  let gitEmail = existingEmail;
+  let gitName = name;
+  let gitEmail = email;
 
   try {
     if (!gitName) {
@@ -2103,258 +1438,202 @@ async function ensureGitIdentity(): Promise<void> {
     throw err;
   }
 
-  if (gitName) {
-    const r = await runGit(['config', 'user.name', gitName]);
-    if (r.code !== 0) throw new Error(`Failed to set git user.name:\n${r.stderr.trim()}`);
-  }
-  if (gitEmail) {
-    const r = await runGit(['config', 'user.email', gitEmail]);
-    if (r.code !== 0) throw new Error(`Failed to set git user.email:\n${r.stderr.trim()}`);
-  }
+  if (gitName) await git.addConfig('user.name', gitName);
+  if (gitEmail) await git.addConfig('user.email', gitEmail);
 
   log.success('Git identity configured for this repository.');
 }
 
-async function ensureGitCredentials(githubRepo: string): Promise<void> {
-  if (!isInteractive()) {
-    throw new Error(
-      'GitHub authentication failed and no terminal is available to prompt for credentials.\n' +
-      'Configure credentials first, e.g.:\n' +
-      '  git config --global credential.helper store\n' +
-      '  git push   (enter your GitHub username and a Personal Access Token once - git will remember it)'
-    );
-  }
-
-  log.warn('GitHub rejected the push - authentication is required.');
-  log.info(
-    'GitHub no longer accepts account passwords for git over HTTPS - use a ' +
-    'Personal Access Token instead (GitHub -> Settings -> Developer settings -> ' +
-    'Personal access tokens, with "repo" scope; add "workflow" scope to push GitHub Actions files).'
+function authHint(githubRepo: string, rawMessage: string): string {
+  const slug = githubRepo.replace(/^https:\/\/github\.com\//, '').replace(/\.git$/, '');
+  return (
+    'Push failed: GitHub rejected the request.\n' +
+    '  Configure git credentials for GitHub over HTTPS with Git Credential Manager (GCM),\n' +
+    '  then re-run bini-deploy. GCM opens a browser once and stores the credential in\n' +
+    '  your OS keychain, so later pushes are silent. No PAT needed.\n\n' +
+    '  Windows   Git for Windows 2.29+ already bundles GCM: just push once and sign in.\n' +
+    '  macOS     brew install --cask git-credential-manager\n' +
+    '  Linux     install GCM (git-credential-manager) and set:\n' +
+    "              git config --global credential.helper manager\n\n" +
+    `  Repo: https://github.com/${slug}\n` +
+    `Raw git error:\n${rawMessage.trim()}`
   );
-
-  let username: string;
-  let token: string;
-
-  try {
-    username = await input({
-      message: 'GitHub username:',
-      validate: (v: string) => v.trim().length > 0 || 'Username is required',
-    });
-
-    token = await password({
-      message: 'GitHub Personal Access Token:',
-      validate: (v: string) => v.trim().length > 0 || 'Token is required',
-    });
-  } catch (err) {
-    if (isExitPromptError(err)) {
-      throw new Error('Cancelled - GitHub credentials are required to push.');
-    }
-    throw err;
-  }
-
-  let host = 'github.com';
-  try {
-    host = new URL(githubRepo).host;
-  } catch {
-    // already validated against GITHUB_URL_REGEX
-  }
-
-  const helperResult = await runGit(['config', '--global', 'credential.helper', 'store']);
-  if (helperResult.code !== 0) {
-    throw new Error(`Failed to configure credential.helper:\n${helperResult.stderr.trim()}`);
-  }
-
-  await new Promise<void>((resolve, reject) => {
-    const child = crossSpawn('git', ['credential', 'approve'], {
-      cwd: process.cwd(),
-      windowsHide: true,
-      stdio: ['pipe', 'ignore', 'pipe'],
-    });
-    let stderr = '';
-    child.stderr?.on('data', (chunk) => {
-      stderr += chunk.toString();
-    });
-    child.on('error', reject);
-    child.on('exit', (code) => {
-      code === 0 ? resolve() : reject(new Error(`Failed to save credentials: ${stderr.trim()}`));
-    });
-    child.stdin?.write(`protocol=https\nhost=${host}\nusername=${username}\npassword=${token}\n\n`);
-    child.stdin?.end();
-  });
-
-  log.success("Credentials saved - future pushes to this host won't prompt again.");
 }
 
-async function pushToGitHub(githubRepo: string): Promise<void> {
+async function switchToDefaultBranch(git: SimpleGit): Promise<void> {
+  // symbolic-ref also works on a repository with no commits yet.
+  const current = (await git.raw(['symbolic-ref', '--short', 'HEAD']).catch(() => '')).trim();
+  if (!current || current === DEFAULT_BRANCH) return;
+
+  log.info(`Switching from ${current} to ${DEFAULT_BRANCH}...`);
+  try {
+    const branches = await git.branchLocal();
+    if (branches.all.includes(DEFAULT_BRANCH)) {
+      await git.checkout(DEFAULT_BRANCH);
+    } else {
+      await git.raw(['branch', '-m', current, DEFAULT_BRANCH]);
+    }
+  } catch (err) {
+    throw new Error(
+      `Could not switch to '${DEFAULT_BRANCH}'. Commit or stash your local changes, then run again.\n` +
+        `Raw git error:\n${(err as Error).message.trim()}`,
+    );
+  }
+}
+
+async function pushToGitHub(
+  githubRepo: string,
+  opts: { commitMessage?: string; interactive?: boolean } = {},
+): Promise<void> {
   const cwd = process.cwd();
   const isGitRepo = existsSync(path.join(cwd, '.git'));
+  const git = makeGit();
 
   if (!isGitRepo) {
     log.step('Initializing git repository...');
-    const initResult = await runGit(['init', '-b', DEFAULT_BRANCH]);
-    if (initResult.code !== 0) {
-      throw new Error(`git init failed:\n${(initResult.stderr || initResult.stdout).trim()}`);
+    try {
+      await git.init(['--initial-branch', DEFAULT_BRANCH]);
+    } catch (err) {
+      throw new Error(`git init failed:\n${(err as Error).message}`);
     }
     log.info(`Setting remote origin: ${githubRepo}`);
-    const remoteAddResult = await runGit(['remote', 'add', 'origin', githubRepo]);
-    if (remoteAddResult.code !== 0) {
-      throw new Error(`Failed to add remote 'origin':\n${remoteAddResult.stderr.trim()}`);
-    }
+    await git.addRemote('origin', githubRepo);
   } else {
-    let remoteExists = false;
-    const remotesResult = await runGit(['remote']);
-    if (remotesResult.code === 0 && remotesResult.stdout.includes('origin')) {
-      remoteExists = true;
-      const urlResult = await runGit(['remote', 'get-url', 'origin']);
-      log.info(urlResult.code === 0 ? `Using existing remote: ${urlResult.stdout.trim()}` : 'Using existing remote');
-    }
-
-    if (!remoteExists) {
+    const remotes = await git.getRemotes(true).catch(() => []);
+    const origin = remotes.find((r) => r.name === 'origin');
+    if (origin) {
+      log.info(`Using existing remote: ${origin.refs.fetch || origin.refs.push}`);
+    } else {
       log.info(`Setting remote origin: ${githubRepo}`);
-      const remoteAddResult = await runGit(['remote', 'add', 'origin', githubRepo]);
-      if (remoteAddResult.code !== 0) {
-        throw new Error(`Failed to add remote 'origin':\n${remoteAddResult.stderr.trim()}`);
-      }
+      await git.addRemote('origin', githubRepo);
     }
   }
+
+  // Switch to main BEFORE staging/committing so the commit lands on main.
+  await switchToDefaultBranch(git);
 
   log.step('Adding files to git...');
-  const addResult = await runGit(['add', '--all']);
-  if (addResult.code !== 0) {
-    throw new Error(`git add failed:\n${addResult.stderr.trim()}`);
-  }
+  await git.add(['--all']);
 
-  await ensureGitIdentity();
+  await ensureGitIdentity(git);
 
-  const statusResult = await runGit(['status', '--porcelain']);
-  const hasChanges = statusResult.code === 0 && statusResult.stdout.trim().length > 0;
+  const status = await git.status();
+  const hasChanges = status.files.length > 0;
 
   if (hasChanges) {
+    let commitMessage = opts.commitMessage?.trim() || '';
+    if (!commitMessage && opts.interactive) {
+      commitMessage = (
+        await input({
+          message: 'Commit message (press Enter for the default):',
+          default: DEFAULT_COMMIT_MESSAGE,
+        })
+      ).trim();
+    }
+    if (!commitMessage) commitMessage = DEFAULT_COMMIT_MESSAGE;
+
     log.step('Committing changes...');
-    const commitResult = await runGit(['commit', '-m', 'chore: add deployment configuration']);
-    if (commitResult.code === 0) {
+    try {
+      await git.commit(commitMessage);
       log.success('Changes committed');
-    } else if (/nothing to commit/i.test(commitResult.stdout + commitResult.stderr)) {
-      log.info('No changes to commit');
-    } else {
-      log.warn(`Failed to commit changes, continuing...\n${commitResult.stderr.trim()}`);
+    } catch (err) {
+      const msg = (err as Error).message;
+      if (/nothing to commit/i.test(msg)) {
+        log.info('No changes to commit');
+      } else {
+        log.warn(`Failed to commit changes, continuing...\n${msg.trim()}`);
+      }
     }
   } else {
     log.info('No changes to commit');
   }
 
-  const branchResult = await runGit(['branch', '--show-current']);
-  const currentBranch = branchResult.stdout.trim();
-
-  if (currentBranch && currentBranch !== DEFAULT_BRANCH) {
-    log.info(`Switching from ${currentBranch} to ${DEFAULT_BRANCH}...`);
-    const listResult = await runGit(['branch', '--list', DEFAULT_BRANCH]);
-    if (listResult.stdout.trim()) {
-      await runGit(['checkout', DEFAULT_BRANCH]);
-    } else {
-      await runGit(['branch', '-m', currentBranch, DEFAULT_BRANCH]);
-    }
-  }
-
   log.step('Pushing to GitHub...');
 
-  const attemptPush = () => runGit(['push', '-u', 'origin', `HEAD:${DEFAULT_BRANCH}`], { inherit: true });
+  const attemptPush = () => git.push('origin', `HEAD:${DEFAULT_BRANCH}`, ['--set-upstream']);
 
-  let result = await attemptPush();
-
-  if (result.code === 0) {
+  try {
+    await attemptPush();
     log.success('Push successful');
     return;
-  }
+  } catch (err) {
+    const message = (err as Error).message || String(err);
+    const kind = classifyGitError(message);
 
-  let kind = classifyGitError(result.stderr);
-
-  if (kind === 'auth') {
-    await ensureGitCredentials(githubRepo);
-    result = await attemptPush();
-    if (result.code === 0) {
-      log.success('Push successful');
-      return;
-    }
-    kind = classifyGitError(result.stderr);
     if (kind === 'auth') {
+      throw new Error(authHint(githubRepo, message));
+    }
+
+    if (kind === 'not-found') {
       throw new Error(
-        `Push still failed after configuring credentials - double-check the token has 'repo' scope (and 'workflow' scope for GitHub Actions files) and hasn't expired.\n` +
-        `Raw git error:\n${result.stderr.trim()}`
+        `Push failed: repository not found at '${githubRepo}'.\n` +
+          `  - Confirm the repository exists and the URL is correct\n` +
+          `  - Confirm your account has push access to it\n` +
+          `Raw git error:\n${message.trim()}`,
+      );
+    }
+
+    if (kind !== 'non-fast-forward') {
+      throw new Error(`Push failed:\n${message.trim() || 'Unknown git error.'}`);
+    }
+
+    log.warn('Push rejected - the remote has commits that are not present locally.');
+    log.step('Attempting to fetch and merge remote changes...');
+
+    try {
+      await git.fetch('origin', DEFAULT_BRANCH);
+    } catch (fetchErr) {
+      throw new Error(
+        `Failed to fetch '${DEFAULT_BRANCH}' from origin.\n` + `Raw git error:\n${(fetchErr as Error).message.trim()}`,
+      );
+    }
+
+    log.warn(
+      'Merging remote history with -X ours: for any file that exists both ' +
+        'locally and on the remote, your local version will be kept and the ' +
+        'remote version discarded. Files that only exist on the remote are ' +
+        'still merged in normally.',
+    );
+
+    try {
+      await git.raw([
+        'merge',
+        `origin/${DEFAULT_BRANCH}`,
+        '--allow-unrelated-histories',
+        '-X',
+        'ours',
+        '-m',
+        'chore: merge remote changes',
+      ]);
+    } catch (mergeErr) {
+      throw new Error(
+        'Automatic merge failed, likely due to conflicting files (e.g. README.md).\n' +
+          'Resolve the conflicts manually, then run:\n' +
+          '  git add .\n' +
+          '  git commit\n' +
+          `  git push -u origin ${DEFAULT_BRANCH}\n\n` +
+          `Raw git error:\n${(mergeErr as Error).message.trim()}`,
+      );
+    }
+
+    try {
+      await git.push('origin', `HEAD:${DEFAULT_BRANCH}`, ['--set-upstream']);
+      log.success('Push successful after merging remote changes');
+    } catch (finalErr) {
+      throw new Error(
+        'Push still failed after merging remote changes.\n' +
+          'You can resolve this manually by running:\n' +
+          `  git pull origin ${DEFAULT_BRANCH} --allow-unrelated-histories -X ours\n` +
+          `  git push -u origin ${DEFAULT_BRANCH}\n\n` +
+          `Raw git error:\n${(finalErr as Error).message.trim()}`,
       );
     }
   }
-
-  if (kind === 'not-found') {
-    throw new Error(
-      `Push failed: repository not found at '${githubRepo}'.\n` +
-      `  - Confirm the repository exists and the URL is correct\n` +
-      `  - Confirm your account has push access to it\n` +
-      `Raw git error:\n${result.stderr.trim()}`
-    );
-  }
-
-  if (kind !== 'non-fast-forward') {
-    throw new Error(
-      `Push failed:\n${result.stderr.trim() || result.stdout.trim() || 'Unknown git error.'}`
-    );
-  }
-
-  log.warn('Push rejected - the remote has commits that are not present locally.');
-  log.step('Attempting to fetch and merge remote changes...');
-
-  const fetchResult = await runGit(['fetch', 'origin', DEFAULT_BRANCH]);
-  if (fetchResult.code !== 0) {
-    throw new Error(
-      `Failed to fetch '${DEFAULT_BRANCH}' from origin.\n` +
-      `Raw git error:\n${fetchResult.stderr.trim()}`
-    );
-  }
-
-  log.warn(
-    'Merging remote history with -X ours: for any file that exists both ' +
-    'locally and on the remote, your local version will be kept and the ' +
-    'remote version discarded. Files that only exist on the remote are ' +
-    'still merged in normally.'
-  );
-
-  const mergeResult = await runGit([
-    'merge',
-    `origin/${DEFAULT_BRANCH}`,
-    '--allow-unrelated-histories',
-    '-X',
-    'ours',
-    '-m',
-    'chore: merge remote changes',
-  ]);
-
-  if (mergeResult.code !== 0) {
-    throw new Error(
-      'Automatic merge failed, likely due to conflicting files (e.g. README.md).\n' +
-      'Resolve the conflicts manually, then run:\n' +
-      '  git add .\n' +
-      '  git commit\n' +
-      `  git push -u origin ${DEFAULT_BRANCH}\n\n` +
-      `Raw git error:\n${mergeResult.stderr.trim()}`
-    );
-  }
-
-  result = await attemptPush();
-  if (result.code === 0) {
-    log.success('Push successful after merging remote changes');
-    return;
-  }
-
-  throw new Error(
-    'Push still failed after merging remote changes.\n' +
-    'You can resolve this manually by running:\n' +
-    `  git pull origin ${DEFAULT_BRANCH} --allow-unrelated-histories -X ours\n` +
-    `  git push -u origin ${DEFAULT_BRANCH}\n\n` +
-    `Raw git error:\n${result.stderr.trim()}`
-  );
 }
 
-const NATIVE_ALIASES: Record<string, NativePlatform> = {
+/* ─────────────────────────── CLI ─────────────────────────── */
+
+const NATIVE_ALIASES: Record<string, NativeTarget> = {
   desktop: 'desktop',
   windows: 'desktop',
   macos: 'desktop',
@@ -2363,12 +1642,12 @@ const NATIVE_ALIASES: Record<string, NativePlatform> = {
   ios: 'ios',
 };
 
-function parsePlatformArg(raw: string): { platform: 'web' | 'native'; targets: NativePlatform[] } {
+function parsePlatformArg(raw: string): { platform: 'web' | 'native'; targets: NativeTarget[] } {
   const parts = raw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
   if (parts.length === 0) throw new Error('--platform requires a value (web, desktop, android, ios)');
 
   const hasWeb = parts.includes('web');
-  const targets: NativePlatform[] = [];
+  const targets: NativeTarget[] = [];
 
   for (const part of parts) {
     if (part === 'web') continue;
@@ -2386,34 +1665,46 @@ function parsePlatformArg(raw: string): { platform: 'web' | 'native'; targets: N
   return hasWeb ? { platform: 'web', targets: [] } : { platform: 'native', targets };
 }
 
-function parseArgs(): Partial<DeployAnswers> & { generateEntry?: NonNodePlatform; platformArg?: string } {
-  const args = process.argv.slice(2);
-  const result: Partial<DeployAnswers> & { generateEntry?: NonNodePlatform; platformArg?: string } = {
-    skipPrompts: false,
-    noSign: false,
-  };
+const CLI_OPTIONS = {
+  platform: { type: 'string' },
+  hosting: { type: 'string' },
+  repo: { type: 'string' },
+  'generate-entry': { type: 'string' },
+  message: { type: 'string', short: 'm' },
+  'dry-run': { type: 'boolean' },
+  yes: { type: 'boolean', short: 'y' },
+  help: { type: 'boolean', short: 'h' },
+} as const;
 
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    if (arg === '--platform' && args[i + 1]) {
-      result.platformArg = args[++i];
-    } else if (arg === '--hosting' && args[i + 1]) {
-      result.webHosting = args[++i] as Platform;
-    } else if (arg === '--repo' && args[i + 1]) {
-      result.githubRepo = args[++i];
-    } else if (arg === '--generate-entry' && args[i + 1]) {
-      result.generateEntry = args[++i] as NonNodePlatform;
-    } else if (arg === '--nosign') {
-      result.noSign = true;
-    } else if (arg === '--yes' || arg === '-y') {
-      result.skipPrompts = true;
-    } else if (arg === '--help' || arg === '-h') {
+function parseArgs() {
+  try {
+    const { values } = nodeParseArgs({
+      args: process.argv.slice(2),
+      options: CLI_OPTIONS,
+      allowPositionals: false,
+      strict: true,
+    });
+
+    if (values.help) {
       showHelp();
       process.exit(0);
     }
-  }
 
-  return result;
+    return {
+      platformArg: values.platform as string | undefined,
+      webHosting: values.hosting as Platform | undefined,
+      githubRepo: values.repo as string | undefined,
+      generateEntry: values['generate-entry'] as NonNodePlatform | undefined,
+      commitMessage: values.message as string | undefined,
+      dryRun: Boolean(values['dry-run']),
+      skipPrompts: Boolean(values.yes),
+    };
+  } catch (err) {
+    const message = (err as Error).message;
+    log.error(message);
+    log.info('Run with --help to see available options.');
+    process.exit(1);
+  }
 }
 
 function showHelp(): void {
@@ -2429,41 +1720,52 @@ ${c.heading('Options:')}
   --hosting <name>        Hosting provider for web: node, netlify, vercel, cloudflare, deno
   --repo <url>            GitHub repository URL
   --generate-entry <host> Generate production entry file only (netlify, vercel, cloudflare, deno)
-  --nosign                Native only: skip the create-bini-app sign step
+  --message, -m <text>    Commit message (default: "chore: add deployment configuration"; prompted when interactive)
+  --dry-run               Show what would be written and pushed, but do nothing
   --yes, -y               Skip interactive prompts (use provided flags)
   --help, -h              Show this help message
 
+${c.heading('Git auth:')}
+  Pushes use git over HTTPS. Configure Git Credential Manager (GCM) once and git
+  will sign in through your browser (no Personal Access Token needed):
+    Windows   Git for Windows 2.29+ bundles GCM; just push once and sign in
+    macOS     brew install --cask git-credential-manager
+    Linux     install git-credential-manager, then:
+                git config --global credential.helper manager
+
 ${c.heading('Native targets:')}
-  Generates GitHub Actions workflows (.github/workflows/desktop.yml, android.yml, ios.yml) and removes
-  web hosting files. Builds run on GitHub, so this works from any OS.
-  Every push to main builds the app and publishes a GitHub release tagged v<version>, where <version>
-  comes from package.json. Installers are attached to the release and also uploaded as run artifacts.
-  Signing secrets are uploaded to GitHub before the push, so the first CI run already sees them.
-  Signing is set up with ${c.yellow('create-bini-app sign <target> --ci-only')}:
-    Windows, Linux, Android  let the workflow generate a self-signed key (a publisher name, plus a keystore
-                             password for Android) or use real credentials. A generated key is created on
-                             the first build, saved as a GitHub secret and reused, which needs a repository
-                             secret ${c.yellow('SECRETS_PAT')} (deploy offers to add it).
-    macOS, iOS               cannot be generated: real Apple credentials, otherwise macOS signs ad-hoc and
-                             iOS builds for the simulator only (uploaded as the ios-simulator artifact,
-                             no GitHub release).
-  Everything in .env.signing is uploaded as GitHub secrets with the GitHub CLI.
-  Windows cloud signing (Azure Artifact Signing, Azure Key Vault/relic, SSL.com eSigner, jsign) is detected
-  from tauri.cloud-sign.conf.json and the matching CLI is installed by the generated workflow.
-  App icons are regenerated from public/logo.png before every build.
+  Copies .github/workflows/{desktop,android,ios}.yml from bini-deploy's own templates
+  (kept in sync with the Tauri docs). If .env.signing is missing, it offers to run
+  create-bini-app sign for each target that is part of this project (interactive runs
+  only). It then uploads the values in .env.signing for the selected targets as
+  repository secrets with the GitHub CLI (gh must be installed and logged in), and
+  pushes the project to GitHub.
+
+  Signing is configured by ${c.yellow('create-bini-app sign <target> --ci-only')}:
+    Windows      a .pfx file, or a cloud signCommand in tauri.windows.conf.json
+    macOS        a .p12 with an Apple signing identity; notarization via API key or Apple ID
+    Linux        your GPG key (gpg --full-gen-key); CI reads GPG_PRIVATE_KEY + SIGN_KEY
+    iOS          Apple Distribution .p12 + provisioning profile, or App Store Connect API key
+    Android      a keystore .jks + password; keytool generates it locally or you supply one
+
+  Builds, signing, and releases are done by tauri-action (desktop) or plain
+  npx tauri android|ios build steps (mobile), as documented on v2.tauri.app.
 
 ${c.heading('Examples:')}
 ${[
   'bini-deploy --platform web --hosting vercel --repo https://github.com/user/my-app --yes',
   'bini-deploy --platform desktop,android,ios --repo https://github.com/user/my-app -y',
+  'bini-deploy --platform desktop --repo https://github.com/user/my-app --dry-run',
   'bini-deploy --generate-entry netlify',
   'bini-deploy',
-].map((e) => `  ${c.dim(e)}`).join('\n')}
+]
+  .map((e) => `  ${c.dim(e)}`)
+  .join('\n')}
 `);
 }
 
 async function getAnswersInteractive(): Promise<DeployAnswers> {
-  const picked = await checkbox<'web' | NativePlatform>({
+  const picked = await checkbox<'web' | NativeTarget>({
     message: 'Platforms?',
     choices: [
       { name: 'Web', value: 'web' },
@@ -2478,7 +1780,7 @@ async function getAnswersInteractive(): Promise<DeployAnswers> {
   });
 
   const kind: 'web' | 'native' = picked.includes('web') ? 'web' : 'native';
-  const targets = picked.filter((p): p is NativePlatform => p !== 'web');
+  const targets = picked.filter((p): p is NativeTarget => p !== 'web');
 
   let webHosting: Platform | undefined;
   if (kind === 'web') {
@@ -2495,21 +1797,19 @@ async function getAnswersInteractive(): Promise<DeployAnswers> {
   const isGitRepo = existsSync(path.join(process.cwd(), '.git'));
 
   if (isGitRepo) {
-    const remotesResult = await runGit(['remote']);
-    if (remotesResult.code === 0 && remotesResult.stdout.includes('origin')) {
-      const urlResult = await runGit(['remote', 'get-url', 'origin']);
-      if (urlResult.code === 0) {
-        githubRepo = urlResult.stdout.trim();
-        log.info(`Using existing git remote: ${githubRepo}`);
-      }
+    const git = makeGit();
+    const remotes = await git.getRemotes(true).catch(() => []);
+    const origin = remotes.find((r) => r.name === 'origin');
+    if (origin) {
+      githubRepo = origin.refs.fetch || origin.refs.push;
+      log.info(`Using existing git remote: ${githubRepo}`);
     }
   }
 
   if (!githubRepo) {
     githubRepo = await input({
       message: 'GitHub repository URL?',
-      validate: (value: string) =>
-        GITHUB_URL_REGEX.test(value) || 'Please enter a valid GitHub repository URL',
+      validate: (value: string) => GITHUB_URL_REGEX.test(value) || 'Please enter a valid GitHub repository URL',
     });
   }
 
@@ -2520,13 +1820,14 @@ async function getAnswersInteractive(): Promise<DeployAnswers> {
     githubRepo,
     projectName: githubRepo.split('/').pop() || 'my-app',
     skipPrompts: false,
-    noSign: false,
   };
 }
 
-async function getAnswersFromFlags(
-  flags: Partial<DeployAnswers> & { platformArg?: string },
-): Promise<DeployAnswers> {
+async function getAnswersFromFlags(flags: {
+  platformArg?: string;
+  githubRepo?: string;
+  webHosting?: Platform;
+}): Promise<DeployAnswers> {
   if (!flags.platformArg) {
     throw new Error('--platform is required when using --yes flag');
   }
@@ -2545,7 +1846,6 @@ async function getAnswersFromFlags(
     githubRepo: flags.githubRepo,
     projectName: flags.githubRepo.split('/').pop() || 'my-app',
     skipPrompts: true,
-    noSign: Boolean(flags.noSign),
   };
 }
 
@@ -2571,63 +1871,52 @@ function validateAnswers(answers: DeployAnswers): void {
   }
 }
 
-async function executeDeployment(answers: DeployAnswers): Promise<void> {
-  const spinner = createSpinner('Generating deployment files...').start();
+async function executeDeployment(answers: DeployAnswers, dryRun: boolean): Promise<void> {
+  const spinner = clack.spinner();
+  spinner.start('Generating deployment files...');
 
   try {
     const { platform, webHosting, githubRepo, projectName } = answers;
 
     if (platform === 'web' && webHosting && webHosting !== 'node') {
-      spinner.text = `Generating production API entry for ${webHosting}...`;
+      spinner.message(`Generating production API entry for ${webHosting}...`);
 
       try {
         await generateProductionEntry(webHosting);
-      } catch (error) {
+      } catch {
         log.warn('Failed to generate production entry, but continuing...');
       }
 
-      spinner.text = `Generating ${HOSTING_CONFIGS[webHosting].label} configuration...`;
+      spinner.message(`Generating ${HOSTING_CONFIGS[webHosting].label} configuration...`);
       const configPath = await generateHostingConfig(webHosting, projectName);
       if (configPath) {
         log.info(`Generated ${path.relative(process.cwd(), configPath)}`);
       }
     } else if (platform === 'web') {
-      spinner.text = 'Cleaning up old platform artifacts...';
+      spinner.message('Cleaning up old platform artifacts...');
       cleanupPlatformArtifacts('node', isTypeScriptProject());
     }
 
     if (platform === 'native') {
-      spinner.text = 'Removing web hosting files...';
+      spinner.message('Removing web hosting files...');
       cleanupPlatformArtifacts('node', isTypeScriptProject());
-
-      spinner.text = 'Checking the Tauri project...';
-      assertNativeProject(answers.targets);
-      ensureSigningIgnored();
-
       spinner.stop();
-      if (!answers.noSign) await ensureSigning(answers.targets, answers.skipPrompts);
-
-      spinner.start('Generating GitHub workflows...');
-      const workflows = generateWorkflows(answers.targets);
+      await deployNative(answers, dryRun);
+    } else {
       spinner.stop();
-      for (const file of workflows) log.info(`Generated ${file}`);
+      if (dryRun) {
+        log.plain(`\n${c.yellow('Dry run:')} no files pushed.`);
+        return;
+      }
+      await pushToGitHub(githubRepo, {
+        commitMessage: answers.commitMessage,
+        interactive: !answers.skipPrompts && isInteractive(),
+      });
     }
 
-    spinner.stop();
+    log.success(dryRun ? 'Dry run complete' : 'All files generated and pushed to GitHub');
 
-    // Upload signing secrets BEFORE pushing: the push to main starts the
-    // workflows immediately, so secrets uploaded afterwards are missed by
-    // the first run and it builds unsigned.
-    if (platform === 'native' && !answers.noSign) {
-      await uploadSigningSecrets(githubRepo, answers.targets, answers.skipPrompts);
-      await ensureSecretsPat(githubRepo, answers.skipPrompts);
-    }
-
-    await pushToGitHub(githubRepo);
-
-    log.success('All files generated and pushed to GitHub');
-
-    log.plain(`\n${c.heading('Deployment complete')}`);
+    log.plain(`\n${c.heading('Deployment summary')}`);
     log.plain(`  ${c.dim('Platform:')}   ${answers.platform === 'native' ? answers.targets.join(', ') : answers.platform}`);
     if (answers.platform === 'web' && answers.webHosting) {
       log.plain(`  ${c.dim('Hosting:')}    ${HOSTING_CONFIGS[answers.webHosting].label}`);
@@ -2649,31 +1938,11 @@ function printSteps(steps: string[]): void {
 }
 
 function showNextSteps(answers: DeployAnswers): void {
+  const { webHosting, githubRepo } = answers;
+  if (answers.platform !== 'web' || !webHosting) return;
+
   log.plain(`\n${c.heading('Next steps')}`);
-
-  const { platform, webHosting, githubRepo } = answers;
-
-  if (platform === 'web' && webHosting) {
-    printSteps(WEB_NEXT_STEPS[webHosting](detectPackageManager().pm));
-  } else if (platform === 'native') {
-    const files = answers.targets.map((t) => WORKFLOW_FILES[t]);
-    const env = readSigningEnv();
-    const unsigned = signingTargetsFor(answers.targets).filter((t) => !isSigned(t, env));
-
-    const steps = [
-      `Push to main (or run a workflow manually) to build and publish a release`,
-      `Workflows: ${c.yellow(files.join(', '))}`,
-      `Releases are tagged ${c.yellow('v<version>')} where ${c.yellow('version')} comes from package.json`,
-      `Download installers from the ${c.cyan('Releases')} page, or from the run's ${c.cyan('Artifacts')} section`,
-    ];
-    if (unsigned.length > 0 && !answers.noSign) {
-      steps.push(
-        `Unsigned in CI: ${unsigned.map((t) => SIGNING_LABELS[t]).join(', ')} (macOS then signs ad-hoc, iOS builds a simulator-only app). Set up with ${c.yellow('create-bini-app sign <target> --ci-only')}, then run deploy again`,
-      );
-    }
-    printSteps(steps);
-  }
-
+  printSteps(WEB_NEXT_STEPS[webHosting](detectPackageManager()));
   log.plain(`  ${c.dim(`Repository: ${githubRepo}`)}\n`);
 }
 
@@ -2698,8 +1967,9 @@ async function deployCLI(): Promise<void> {
       process.exit(1);
     } else {
       answers = await getAnswersInteractive();
-      answers.noSign = Boolean(flags.noSign);
     }
+
+    answers.commitMessage = flags.commitMessage;
 
     validateAnswers(answers);
 
@@ -2712,7 +1982,11 @@ async function deployCLI(): Promise<void> {
     }
     log.plain(`  ${c.dim('Repository:')} ${c.cyan(answers.githubRepo)}\n`);
 
-    if (!answers.skipPrompts && isInteractive()) {
+    if (flags.dryRun) {
+      log.plain(`${c.yellow('Dry run:')} no files will be written and nothing will be pushed.\n`);
+    }
+
+    if (!answers.skipPrompts && isInteractive() && !flags.dryRun) {
       const confirmed = await confirm({
         message: 'Generate deployment files and push to GitHub?',
         default: true,
@@ -2724,7 +1998,7 @@ async function deployCLI(): Promise<void> {
       }
     }
 
-    await executeDeployment(answers);
+    await executeDeployment(answers, Boolean(flags.dryRun));
   } catch (error) {
     if (isExitPromptError(error)) {
       log.plain('');
@@ -2761,4 +2035,4 @@ if (isMainModule) {
   });
 }
 
-export type { Platform, NonNodePlatform, NativePlatform, DeployAnswers, ApiRoute };
+export type { Platform, NonNodePlatform, NativeTarget, SigningTarget, DeployAnswers, ApiRoute };

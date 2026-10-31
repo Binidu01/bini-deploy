@@ -1,0 +1,194 @@
+# Managed by bini-deploy. Edits are overwritten on the next run.
+name: Desktop
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, label: Windows, args: '' }
+          - { os: macos-latest, label: 'macOS (Apple Silicon)', args: '--target aarch64-apple-darwin' }
+          - { os: macos-latest, label: 'macOS (Intel)', args: '--target x86_64-apple-darwin' }
+          - { os: ubuntu-22.04, label: Linux, args: '' }
+          # - { os: ubuntu-22.04-arm, label: 'Linux (arm64)', args: '' }  # public repos only
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        if: hashFiles('pnpm-lock.yaml') != ''
+        with:
+          version: 10
+
+      - uses: oven-sh/setup-bun@v2
+        if: hashFiles('bun.lock', 'bun.lockb') != ''
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: ${{ hashFiles('pnpm-lock.yaml') != '' && 'pnpm' || hashFiles('yarn.lock') != '' && 'yarn' || hashFiles('package-lock.json') != '' && 'npm' || '' }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ startsWith(matrix.os, 'macos') && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential curl wget file \
+            libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev \
+            patchelf xdg-utils
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then yarn install --frozen-lockfile
+          elif [ -f bun.lock ] || [ -f bun.lockb ]; then bun install --frozen-lockfile
+          elif [ -f package-lock.json ]; then npm ci
+          else npm install
+          fi
+
+      - name: Generate app icons
+        shell: bash
+        run: |
+          if [ -f pnpm-lock.yaml ]; then pnpm run tauri:icon
+          elif [ -f yarn.lock ]; then yarn run tauri:icon
+          elif [ -f bun.lock ] || [ -f bun.lockb ]; then bun run tauri:icon
+          else npm run tauri:icon
+          fi
+
+      - name: Export signing secrets that are set
+        shell: bash
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          SIGN_KEY: ${{ secrets.SIGN_KEY }}
+          APPIMAGETOOL_SIGN_PASSPHRASE: ${{ secrets.APPIMAGETOOL_SIGN_PASSPHRASE }}
+          TAURI_SIGNING_RPM_KEY: ${{ secrets.TAURI_SIGNING_RPM_KEY }}
+          TAURI_SIGNING_RPM_KEY_PASSPHRASE: ${{ secrets.TAURI_SIGNING_RPM_KEY_PASSPHRASE }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          # Only export secrets that have a value. An empty variable still counts
+          # as "set" for tauri, which then tries to sign with nothing and fails.
+          for name in WINDOWS_CERTIFICATE WINDOWS_CERTIFICATE_PASSWORD APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD KEYCHAIN_PASSWORD APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_P8 APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET AZURE_TENANT_ID GPG_PRIVATE_KEY SIGN_KEY APPIMAGETOOL_SIGN_PASSPHRASE TAURI_SIGNING_RPM_KEY TAURI_SIGNING_RPM_KEY_PASSPHRASE TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD; do
+            value="${!name}"
+            if [ -n "$value" ]; then
+              {
+                echo "$name<<__BINI_EOF__"
+                echo "$value"
+                echo "__BINI_EOF__"
+              } >> "$GITHUB_ENV"
+            fi
+          done
+
+      - name: Import Windows certificate
+        if: runner.os == 'Windows' && env.WINDOWS_CERTIFICATE != ''
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          New-Item -ItemType directory -Path certificate | Out-Null
+          Set-Content -Path certificate/tempCert.txt -Value $env:WINDOWS_CERTIFICATE
+          certutil -decode certificate/tempCert.txt certificate/certificate.pfx
+          Import-PfxCertificate `
+            -FilePath certificate/certificate.pfx `
+            -CertStoreLocation Cert:\CurrentUser\My `
+            -Password (ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -Force -AsPlainText) | Out-Null
+          Remove-Item -Recurse -Force certificate
+
+      - name: Install Windows cloud signer (if configured)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cfg="$(cat src-tauri/tauri*.json 2>/dev/null || true)"
+          if echo "$cfg" | grep -q 'artifact-signing-cli'; then
+            dotnet tool install --global artifact-signing-cli
+            echo "$USERPROFILE/.dotnet/tools" >> "$GITHUB_PATH"
+          elif echo "$cfg" | grep -q 'relic'; then
+            cargo install relic
+            echo "$USERPROFILE/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Write App Store Connect API key (macOS)
+        if: runner.os == 'macOS' && env.APPLE_API_KEY_P8 != ''
+        shell: bash
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          echo "$APPLE_API_KEY_P8" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/AuthKey.p8" >> "$GITHUB_ENV"
+
+      - name: Import Linux GPG key
+        if: runner.os == 'Linux' && env.GPG_PRIVATE_KEY != ''
+        shell: bash
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          SIGN_KEY: ${{ secrets.SIGN_KEY }}
+          APPIMAGETOOL_SIGN_PASSPHRASE: ${{ secrets.APPIMAGETOOL_SIGN_PASSPHRASE }}
+        run: |
+          echo "$GPG_PRIVATE_KEY" | base64 --decode | gpg --batch --import
+          {
+            echo "SIGN=1"
+            echo "SIGN_KEY=$SIGN_KEY"
+            echo "APPIMAGETOOL_FORCE_SIGN=1"
+          } >> "$GITHUB_ENV"
+          if [ -n "$APPIMAGETOOL_SIGN_PASSPHRASE" ]; then
+            echo "APPIMAGETOOL_SIGN_PASSPHRASE=$APPIMAGETOOL_SIGN_PASSPHRASE" >> "$GITHUB_ENV"
+          fi
+
+      - name: Warn if unsigned
+        shell: bash
+        run: |
+          [ "$RUNNER_OS" = "Windows" ] && [ -z "$WINDOWS_CERTIFICATE" ] && echo "::warning::No WINDOWS_CERTIFICATE; unsigned unless a cloud signCommand is configured."
+          [ "$RUNNER_OS" = "macOS" ] && [ -z "$APPLE_CERTIFICATE" ] && echo "::warning::No APPLE_CERTIFICATE; using ad-hoc signing (not distributable)."
+          [ "$RUNNER_OS" = "Linux" ] && [ -z "$GPG_PRIVATE_KEY" ] && echo "::warning::No GPG_PRIVATE_KEY; AppImage is unsigned."
+          exit 0
+
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Ad-hoc signing ('-') unless a real certificate secret exists.
+          # All other signing variables come from the export step above.
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_SIGNING_IDENTITY || '-' }}
+        with:
+          tagName: app-v__VERSION__
+          releaseName: 'App v__VERSION__ (${{ matrix.label }})'
+          releaseBody: 'Download the installer for your platform below.'
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
